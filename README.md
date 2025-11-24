@@ -31,7 +31,9 @@ pip install target/wheels/*.whl
 ```
 ## 使用示例
 ```
-# vnpy.api.rest/__init__.py代码修改如下
+# vnpyt/apit/rest/__init__.py代码修改如下
 #from .rest_client import Request, Response, RestClient
 from rust_rest_client import Request, RestClient
+# 交易接口初始化需要传递的参数，我增加了gateway_name参数方便定位接口错误
+self.init(REST_HOST, proxy_host, proxy_port, gateway_name=self.gateway_name)
 ```
