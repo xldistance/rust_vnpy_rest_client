@@ -25,6 +25,7 @@ pip install maturin
 ```
 **生产构建：**
 ```bash
+cd rust_rest_client_project
 maturin build --release
 pip install target/wheels/*.whl
 ```
