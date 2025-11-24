@@ -1,0 +1,1 @@
+maturin build --release --out ../rust_whl/ && cargo clean
