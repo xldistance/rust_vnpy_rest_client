@@ -5,9 +5,7 @@ use reqwest::Client;
 use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
 use tokio::sync::{mpsc, Semaphore, RwLock, oneshot};
 use tokio::time::{timeout, Duration, Instant};
-use chrono::Local;
 use serde_json::Value;
-use futures::future::join_all;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use indexmap::IndexMap;
@@ -238,90 +236,122 @@ enum PythonTask {
         exception_value: String,
         request: Option<Py<Request>>,
     },
+    // 新增日志任务
+    WriteLog {
+        message: String,
+    },
+    // 新增保存连接状态任务
+    SaveConnectionStatus {
+        gateway_name: String,
+        status: bool,
+    },
 }
+
 
 /// Python 操作执行器
 struct PythonExecutor {
     task_tx: mpsc::UnboundedSender<PythonTask>,
-    _handle: tokio::task::JoinHandle<()>,
+    _handle: std::thread::JoinHandle<()>,
 }
 
 impl PythonExecutor {
     fn new() -> Self {
         let (task_tx, mut task_rx) = mpsc::unbounded_channel::<PythonTask>();
         
-        let handle = tokio::spawn(async move {
+        // 在独立线程中创建多线程 runtime，避免初始化时的 runtime 依赖
+        let handle = std::thread::spawn(move || {
+            // 使用多线程 runtime 以支持更好的并发
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(std::cmp::min(num_cpus::get(), 8))  // 可以根据需要调整
+                .thread_name("python-executor")
+                .enable_all()
+                .build()
+                .expect("Failed to create Python executor runtime");
+            
             // 创建专用的线程池用于 Python 操作
             let python_pool = std::sync::Arc::new(
                 threadpool::ThreadPool::with_name("python-ops".to_string(), 4)
             );
             
-            while let Some(task) = task_rx.recv().await {
-                let pool = python_pool.clone();
-                
-                match task {
-                    PythonTask::Sign { client, request, response_tx } => {
-                        pool.execute(move || {
-                            let result = Python::attach(|py| -> PyResult<Py<Request>> {
-                                
-                                let result = client.bind(py).call_method1("sign", (request.bind(py),))?;
-                                let signed_request = result.extract::<Py<Request>>()?;
-                                
-                                Ok(signed_request)
+            // 在这个 runtime 中运行任务处理循环
+            rt.block_on(async move {
+                while let Some(task) = task_rx.recv().await {
+                    let pool = python_pool.clone();
+                    
+                    match task {
+                        PythonTask::Sign { client, request, response_tx } => {
+                            pool.execute(move || {
+                                let result = Python::attach(|py| -> PyResult<Py<Request>> {
+                                    let result = client.bind(py).call_method1("sign", (request.bind(py),))?;
+                                    let signed_request = result.extract::<Py<Request>>()?;
+                                    Ok(signed_request)
+                                });
+                                let _ = response_tx.send(result);
                             });
-                            
-                            let _ = response_tx.send(result);
-                        });
-                    },
-                    PythonTask::Callback { callback, data, request } => {
-                        pool.execute(move || {
-                            let _ = Python::attach(|py| -> PyResult<()> {
-                                let py_dict = json_to_pyobject(py, &data)?;
-                                callback.bind(py).call1((py_dict, request.bind(py)))?;
-                                Ok(())
+                        },
+                        PythonTask::Callback { callback, data, request } => {
+                            pool.execute(move || {
+                                let _ = Python::attach(|py| -> PyResult<()> {
+                                    let py_dict = json_to_pyobject(py, &data)?;
+                                    callback.bind(py).call1((py_dict, request.bind(py)))?;
+                                    Ok(())
+                                });
                             });
-                        });
-                    },
-                    PythonTask::OnFailed { callback, status_code, request } => {
-                        pool.execute(move || {
-                            let _ = Python::attach(|py| -> PyResult<()> {
-                                callback.bind(py).call1((status_code, request.bind(py)))?;
-                                Ok(())
+                        },
+                        PythonTask::OnFailed { callback, status_code, request } => {
+                            pool.execute(move || {
+                                let _ = Python::attach(|py| -> PyResult<()> {
+                                    callback.bind(py).call1((status_code, request.bind(py)))?;
+                                    Ok(())
+                                });
                             });
-                        });
-                    },
-                    PythonTask::OnError { callback, exception_type, exception_value, request } => {
-                        pool.execute(move || {
-                            let _ = Python::attach(|py| -> PyResult<()> {
-                                if let Some(req) = request {
-                                    callback.bind(py).call1((
-                                        py.get_type::<pyo3::exceptions::PyException>(),
-                                        exception_value,
-                                        py.None(),
-                                        req.bind(py)
-                                    ))?;
-                                } else {
-                                    callback.bind(py).call1((
-                                        py.get_type::<pyo3::exceptions::PyException>(),
-                                        exception_value,
-                                        py.None(),
-                                        py.None()
-                                    ))?;
-                                }
-                                Ok(())
+                        },
+                        PythonTask::OnError { callback, exception_type, exception_value, request } => {
+                            pool.execute(move || {
+                                let _ = Python::attach(|py| -> PyResult<()> {
+                                    if let Some(req) = request {
+                                        callback.bind(py).call1((
+                                            py.get_type::<pyo3::exceptions::PyException>(),
+                                            exception_value,
+                                            py.None(),
+                                            req.bind(py)
+                                        ))?;
+                                    } else {
+                                        callback.bind(py).call1((
+                                            py.get_type::<pyo3::exceptions::PyException>(),
+                                            exception_value,
+                                            py.None(),
+                                            py.None()
+                                        ))?;
+                                    }
+                                    Ok(())
+                                });
                             });
-                        });
-                    },
+                        },
+                        PythonTask::WriteLog { message } => {
+                            pool.execute(move || {
+                                let _ = Python::attach(|py| -> PyResult<()> {
+                                    call_write_log(py, &message)
+                                });
+                            });
+                        },
+                        PythonTask::SaveConnectionStatus { gateway_name, status } => {
+                            pool.execute(move || {
+                                let _ = Python::attach(|py| -> PyResult<()> {
+                                    call_save_connection_status(py, &gateway_name, status)
+                                });
+                            });
+                        },
+                    }
                 }
-            }
+            });
         });
         
         Self {
             task_tx,
             _handle: handle,
         }
-    }
-    
+    }    
     /// 异步调用 Python sign 方法
     async fn sign_async(&self, client: Py<RestClient>, request: Py<Request>) -> PyResult<Py<Request>> {
         let (response_tx, response_rx) = oneshot::channel();
@@ -363,7 +393,18 @@ impl PythonExecutor {
             request,
         });
     }
+    
+    /// 异步写日志（不阻塞）
+    fn write_log(&self, message: String) {
+        let _ = self.task_tx.send(PythonTask::WriteLog { message });
+    }
+    
+    /// 异步保存连接状态（不阻塞）
+    fn save_connection_status(&self, gateway_name: String, status: bool) {
+        let _ = self.task_tx.send(PythonTask::SaveConnectionStatus { gateway_name, status });
+    }
 }
+
 
 // 全局 Python 执行器
 static PYTHON_EXECUTOR: Lazy<PythonExecutor> = Lazy::new(|| PythonExecutor::new());
@@ -402,14 +443,12 @@ impl RestClient {
         // 确保 semaphore 正确初始化
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
         
-        // 验证 semaphore 初始化
+        // 验证 semaphore 初始化 - 使用 PYTHON_EXECUTOR 避免死锁
         let available = semaphore.available_permits();
-        let _ = Python::attach(|py| {
-            call_write_log(py, &format!(
-                "Semaphore初始化完成，可用许可: {}", 
-                available
-            ))
-        });
+        PYTHON_EXECUTOR.write_log(format!(
+            "Semaphore初始化完成，可用许可: {}", 
+            available
+        ));
 
         Ok(RestClient {
             url_base: String::new(),
@@ -425,8 +464,7 @@ impl RestClient {
         })
     }
 
-
-
+    
     #[pyo3(signature = (url_base, proxy_host="", proxy_port=0, gateway_name=""))]
     fn init(
         &mut self,
@@ -483,12 +521,10 @@ impl RestClient {
         let gateway_name = self_mut.gateway_name.clone();
         
         if self_mut.active.load(Ordering::SeqCst) {
-            let _ = Python::attach(|py| {
-                call_write_log(py, &format!(
-                    "交易接口：{}，REST客户端已在运行中，跳过启动", 
-                    gateway_name
-                ))
-            });
+            PYTHON_EXECUTOR.write_log(format!(
+                "交易接口：{}，REST客户端已在运行中，跳过启动", 
+                gateway_name
+            ));
             return Ok(());
         }
 
@@ -645,7 +681,6 @@ impl RestClient {
         
         drop(self_ref);
         
-        // === 关键修改：使用 allow_threads 替代 detach ===
         py.detach(move || {
             runtime.block_on(async {
                 // 签名阶段
@@ -667,10 +702,11 @@ impl RestClient {
                     Some(c) => c.clone(),
                     None => {
                         let error_msg = "HTTP client not found";
-                        let _ = Python::attach(|py| {
-                            let _= call_write_log(py, &format!("交易接口：{}，REST API创建出错，错误信息：{}，重启交易子进程", gateway_name, error_msg));
-                            call_save_connection_status(py, &gateway_name, false)
-                        });
+                        PYTHON_EXECUTOR.write_log(format!(
+                            "交易接口：{}，REST API创建出错，错误信息：{}，重启交易子进程", 
+                            gateway_name, error_msg
+                        ));
+                        PYTHON_EXECUTOR.save_connection_status(gateway_name.clone(), false);
                         return Err(PyRuntimeError::new_err(error_msg));
                     }
                 };
@@ -796,11 +832,12 @@ impl RestClient {
                         Ok(Err(e)) => {
                             retry_count += 1;
                             if retry_count >= config.max_retries {
-                                let error_msg = format!("经过{}次重试后REST API连接失败，错误信息：{}",config.max_retries, e);
-                                let _ = Python::attach(|py| {
-                                    let _= call_write_log(py, &format!("交易接口：{}，REST API连接出错，错误信息：{}，重启交易子进程", gateway_name, error_msg));
-                                    call_save_connection_status(py, &gateway_name, false)
-                                });
+                                let error_msg = format!("经过{}次重试后REST API连接失败，错误信息：{}", config.max_retries, e);
+                                PYTHON_EXECUTOR.write_log(format!(
+                                    "交易接口：{}，REST API连接出错，错误信息：{}，重启交易子进程", 
+                                    gateway_name, error_msg
+                                ));
+                                PYTHON_EXECUTOR.save_connection_status(gateway_name.clone(), false);
                                 return Err(PyRuntimeError::new_err(error_msg));
                             }
                             tokio::time::sleep(Duration::from_millis(config.retry_delay_ms)).await;
@@ -809,10 +846,11 @@ impl RestClient {
                             retry_count += 1;
                             if retry_count >= config.max_retries {
                                 let error_msg = format!("请求超时，重试 {} 次后仍未成功", config.max_retries);
-                                let _ = Python::attach(|py| {
-                                    let _= call_write_log(py, &format!("交易接口：{}，REST API连接出错，错误信息：{}，重启交易子进程", gateway_name, error_msg));
-                                    call_save_connection_status(py, &gateway_name, false)
-                                });
+                                PYTHON_EXECUTOR.write_log(format!(
+                                    "交易接口：{}，REST API连接出错，错误信息：{}，重启交易子进程", 
+                                    gateway_name, error_msg
+                                ));
+                                PYTHON_EXECUTOR.save_connection_status(gateway_name.clone(), false);
                                 return Err(PyRuntimeError::new_err(error_msg));
                             }
                             tokio::time::sleep(Duration::from_millis(config.retry_delay_ms)).await;
@@ -822,7 +860,6 @@ impl RestClient {
             })
         })
     }
-
 
     fn get_config(&self) -> String {
         format!("{:?}", self.config)
@@ -934,10 +971,9 @@ impl RestClient {
         exception_value: &str,
         request: Option<&Bound<Request>>,
     ) -> String {
-        let now = Local::now().format("%Y-%m-%dT%H:%M:%S%.6f");
         let mut text = format!(
-            "[{}]：Unhandled RestClient Error：{}\n",
-            now, exception_type
+            "Unhandled RestClient Error：{}\n",
+            exception_type
         );
         
         if let Some(req) = request {
@@ -955,7 +991,7 @@ impl RestClient {
 async fn create_simple_client(
     proxy: Option<String>,
     config: &ClientConfig,
-    gateway_name: &str,  // 添加此参数
+    gateway_name: &str,
 ) -> PyResult<Client> {
     
     let mut builder = Client::builder()
@@ -973,33 +1009,31 @@ async fn create_simple_client(
                 builder = builder.proxy(proxy_obj);
             }
             Err(e) => {
-                let msg = format!("交易接口：{}，✗ 代理配置失败: {}, 继续不使用代理", gateway_name, e);
-                let _ = Python::attach(|py| call_write_log(py, &msg));
+                PYTHON_EXECUTOR.write_log(format!(
+                    "交易接口：{}，✗ 代理配置失败: {}, 继续不使用代理", gateway_name, e
+                ));
             }
         }
     }
 
     match builder.build() {
-        Ok(client) => {
-
-            Ok(client)
-        }
+        Ok(client) => Ok(client),
         Err(e) => {
-            let error_msgs = vec![
-                format!("交易接口：{}，✗ HTTP客户端创建失败!", gateway_name),
-                format!("交易接口：{}，错误详情: {:?}", gateway_name, e),
-                format!("交易接口：{}，错误信息: {}", gateway_name, e),
-                format!("交易接口：{}，客户端创建失败 \n", gateway_name),
-            ];
-            let _ = Python::attach(|py| {
-                for msg in &error_msgs {
-                    let _ = call_write_log(py, msg);
-                }
-            });
+            PYTHON_EXECUTOR.write_log(format!(
+                "交易接口：{}，✗ HTTP客户端创建失败!", gateway_name
+            ));
+            PYTHON_EXECUTOR.write_log(format!(
+                "交易接口：{}，错误详情: {:?}", gateway_name, e
+            ));
+            PYTHON_EXECUTOR.write_log(format!(
+                "交易接口：{}，错误信息: {}", gateway_name, e
+            ));
             Err(PyRuntimeError::new_err(format!("Failed to build HTTP client: {}", e)))
         }
     }
 }
+
+
 
 /// 高并发异步工作器
 async fn run_async_worker(
@@ -1025,12 +1059,10 @@ async fn run_async_worker(
                     false
                 }
                 Ok(None) => {
-                    let _ = Python::attach(|py| {
-                        call_write_log(py, &format!(
-                            "交易接口：{}，接收通道已关闭，停止worker",
-                            gateway_name
-                        ))
-                    });
+                    PYTHON_EXECUTOR.write_log(format!(
+                        "交易接口：{}，接收通道已关闭，停止worker",
+                        gateway_name
+                    ));
                     break;
                 }
                 Err(_) => continue,
@@ -1042,12 +1074,10 @@ async fn run_async_worker(
                     batch.len() >= config.batch_size
                 }
                 Ok(None) => {
-                    let _ = Python::attach(|py| {
-                        call_write_log(py, &format!(
-                            "交易接口：{}，接收通道已关闭（批处理中），停止worker",
-                            gateway_name
-                        ))
-                    });
+                    PYTHON_EXECUTOR.write_log(format!(
+                        "交易接口：{}，接收通道已关闭（批处理中），停止worker",
+                        gateway_name
+                    ));
                     break;
                 }
                 Err(_) => true,
@@ -1079,40 +1109,27 @@ async fn run_async_worker(
 
             if let Some(client) = CLIENT_POOL.get(&client_key) {
                 let client = client.clone();
-                // 这里不再需要等待任务结果，所以不需要收集 JoinHandle
-                // 我们希望任务在后台"发射后不管"(fire-and-forget)，但内部会受信号量控制
 
                 for request_arc in batch.drain(..) {
-                    // 准备闭包需要的变量
                     let client_clone = client.clone();
                     let gateway_name_clone = gateway_name.clone();
                     let url_base_clone = url_base.clone();
                     let config_clone = config.clone();
                     let rest_client_clone = Python::attach(|py| rest_client.clone_ref(py));
-                    // 关键修改：将 semaphore 的 clone 移入循环，并传入 spawn
                     let semaphore_clone = semaphore.clone();
 
                     tokio::spawn(async move {
-                        // === 关键修改开始 ===
-                        // 1. 在这里（子任务内）等待信号量，而不是在主循环中等待
-                        // acquire_owned() 会挂起当前 task 直到有空闲槽位，但这不会阻塞 worker 线程
                         let _permit = match semaphore_clone.acquire_owned().await {
                             Ok(p) => p,
                             Err(e) => {
-                                // 信号量被关闭（通常是程序退出时）
-                                let _ = Python::attach(|py| {
-                                    call_write_log(py, &format!(
-                                        "交易接口：{}，信号量已关闭，丢弃请求: {}",
-                                        gateway_name_clone, e
-                                    ))
-                                });
+                                PYTHON_EXECUTOR.write_log(format!(
+                                    "交易接口：{}，信号量已关闭，丢弃请求: {}",
+                                    gateway_name_clone, e
+                                ));
                                 return;
                             }
                         };
-                        // === 关键修改结束 ===
 
-                        // 2. 获取到信号量后，才开始处理请求
-                        // _permit 会在当前 scope 结束（即请求处理完毕）时自动 drop，释放槽位
                         if let Err(e) = process_request_async(
                             request_arc,
                             &client_clone,
@@ -1121,21 +1138,20 @@ async fn run_async_worker(
                             &config_clone,
                             rest_client_clone,
                         ).await {
-                            let msg = format!("交易所{}，异步request进程出错，错误信息：{}", gateway_name_clone, e);
-                            let _= Python::attach(|py| call_write_log(py, &msg));
+                            PYTHON_EXECUTOR.write_log(format!(
+                                "交易所{}，异步request进程出错，错误信息：{}", 
+                                gateway_name_clone, e
+                            ));
                         }
                     });
                 }
 
             } else {
-                // 客户端未找到日志
-                let _ = Python::attach(|py| {
-                    call_write_log(py, &format!(
-                        "交易接口：{}，错误：HTTP客户端未找到，key: {}",
-                        gateway_name,
-                        client_key
-                    ))
-                });
+                PYTHON_EXECUTOR.write_log(format!(
+                    "交易接口：{}，错误：HTTP客户端未找到，key: {}",
+                    gateway_name,
+                    client_key
+                ));
                 // 重新将请求放回队列
                 if let Some(ref sender) = Python::attach(|py| {
                     rest_client.borrow(py).sender.clone()
@@ -1149,7 +1165,6 @@ async fn run_async_worker(
             last_batch_time = Instant::now();
         }
     }
-
 }
 
 /// 异步处理单个请求
@@ -1159,7 +1174,7 @@ async fn process_request_async(
     gateway_name: &str,
     url_base: &str,
     config: &ClientConfig,
-    rest_client: Py<RestClient>,  // 添加 RestClient 引用用于调用 sign
+    rest_client: Py<RestClient>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 首先对请求进行签名
@@ -1167,12 +1182,12 @@ async fn process_request_async(
         let request_guard = request_arc.read().await;
         let request_py = Python::attach(|py| request_guard.clone_ref(py));
         
-        // 异步调用 sign 方法
         match PYTHON_EXECUTOR.sign_async(rest_client, request_py).await {
             Ok(signed) => signed,
             Err(e) => {
-                let msg = format!("交易接口：{}，签名失败：{}", gateway_name, e);
-                let _ = Python::attach(|py| call_write_log(py, &msg));
+                PYTHON_EXECUTOR.write_log(format!(
+                    "交易接口：{}，签名失败：{}", gateway_name, e
+                ));
                 return Err(format!("Sign failed: {}", e).into());
             }
         }
@@ -1204,27 +1219,23 @@ async fn process_request_async(
                 
                 // 特殊处理502状态码
                 if status_code == 502 {
-                    let url_base_owned = url_base.to_string();
-                    let gateway_name_owned = gateway_name.to_string();
-                    tokio::task::spawn_blocking(move || {
-                        Python::attach(|py| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-                            let request_guard = tokio::task::block_in_place(|| {
-                                tokio::runtime::Handle::current().block_on(request_arc.read())
-                            });
-                            let request = request_guard.borrow(py);
-                            let msg = format!(
-                                "交易接口：{}，REST API请求失败，请求地址：{}{}，错误代码：{}，错误信息：{}",
-                                gateway_name_owned, 
-                                url_base_owned,
-                                request.path,
-                                status_code, 
-                                response_text
-                            );
-                            call_write_log(py, &msg)?;
-                            call_save_connection_status(py, &gateway_name_owned, false)?;
-                            Ok(())
-                        })
-                    }).await??;
+                    let request_guard = request_arc.read().await;
+                    let path = Python::attach(|py| {
+                        let request = request_guard.borrow(py);
+                        request.path.clone()
+                    });
+                    drop(request_guard);
+                    
+                    let msg = format!(
+                        "交易接口：{}，REST API请求失败，请求地址：{}{}，错误代码：{}，错误信息：{}",
+                        gateway_name, 
+                        url_base,
+                        path,
+                        status_code, 
+                        response_text
+                    );
+                    PYTHON_EXECUTOR.write_log(msg);
+                    PYTHON_EXECUTOR.save_connection_status(gateway_name.to_string(), false);
                     return Ok(());
                 }
                 
@@ -1271,9 +1282,10 @@ async fn process_request_async(
                     PYTHON_EXECUTOR.on_failed_async(on_failed, status_code, request_py).await;
                 } else if should_handle_failed {
                     let gateway_name_owned = gateway_name.to_string();
+                    let response_text_clone = response_text.clone();
                     tokio::task::spawn_blocking(move || {
                         Python::attach(|py| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-                            handle_failed_response(py, status_code, &request_py, &gateway_name_owned, &response_text)?;
+                            handle_failed_response(py, status_code, &request_py, &gateway_name_owned, &response_text_clone)?;
                             Ok(())
                         })
                     }).await??;
@@ -1283,12 +1295,14 @@ async fn process_request_async(
             }
             Ok(Err(e)) => {
                 retry_count += 1;
-                let msg1 = format!("交易接口：{}，请求执行失败 (重试 {}/{})", gateway_name, retry_count, config.max_retries);
-                let msg2 = format!("交易接口：{}，错误信息：{}", gateway_name, e);
-                let _ = Python::attach(|py| {
-                    let _ = call_write_log(py, &msg1);
-                    let _ = call_write_log(py, &msg2);
-                });
+                PYTHON_EXECUTOR.write_log(format!(
+                    "交易接口：{}，请求执行失败 (重试 {}/{})", 
+                    gateway_name, retry_count, config.max_retries
+                ));
+                PYTHON_EXECUTOR.write_log(format!(
+                    "交易接口：{}，错误信息：{}", gateway_name, e
+                ));
+                
                 if retry_count >= config.max_retries {
                     
                     let request_guard = request_arc.write().await;
@@ -1316,13 +1330,14 @@ async fn process_request_async(
                         ).await;
                     } else {
                         let gateway_name_owned = gateway_name.to_string();
+                        let gateway_name_for_status = gateway_name.to_string();
                         tokio::task::spawn_blocking(move || {
                             Python::attach(|py| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 handle_error_response(py, &error_msg, &request_py, &gateway_name_owned)?;
-                                call_save_connection_status(py, &gateway_name_owned, false)?;
                                 Ok(())
                             })
                         }).await??;
+                        PYTHON_EXECUTOR.save_connection_status(gateway_name_for_status, false);
                     }
                     
                     break;
@@ -1477,12 +1492,12 @@ async fn execute_request_async_internal(
                 } else if let Ok(data_dict) = data_obj.cast::<PyDict>() {
                     if data_dict.len() > 0 {
                         match pythondict_to_json_string(data_dict) {
-                            Ok(json_str) => {
-                                Some(json_str)
-                            }
+                            Ok(json_str) => Some(json_str),
                             Err(e) => {
-                                let msg = format!("交易接口：{}，Dict转JSON失败，错误信息： {}", gateway_name, e);
-                                let _ = Python::attach(|py| call_write_log(py, &msg));
+                                PYTHON_EXECUTOR.write_log(format!(
+                                        "交易接口：{}，Dict转JSON失败，错误信息： {}", 
+                                        gateway_name, e
+                                    ));
                                 None
                             }
                         }
@@ -1508,8 +1523,10 @@ async fn execute_request_async_internal(
                             }
                         }
                         Err(e) => {
-                            let msg = format!("交易接口：{}，request.data转换失败，错误信息：{}", gateway_name, e);
-                            let _ = Python::attach(|py| call_write_log(py, &msg));
+                            PYTHON_EXECUTOR.write_log(format!(
+                                    "交易接口：{}，request.data转换失败，错误信息：{}", 
+                                    gateway_name, e
+                                ));
                             None
                         }
                     }
@@ -1522,8 +1539,9 @@ async fn execute_request_async_internal(
         })
     };
 
-    execute_request_with_data(client, &method, &url, headers_data, query_params, body_data,gateway_name).await
+    execute_request_with_data(client, &method, &url, headers_data, query_params, body_data, gateway_name).await
 }
+
 
 async fn execute_request_with_data(
     client: &Client,
@@ -1532,7 +1550,7 @@ async fn execute_request_with_data(
     headers_data: Vec<(String, String)>,
     query_params: Vec<(String, String)>,
     body_data: Option<String>,
-    gateway_name: &str,  // 添加此参数
+    gateway_name: &str,
 ) -> Result<(u16, String, Value, IndexMap<String, String>), Box<dyn std::error::Error + Send + Sync>> {
     
     let http_method = match method.to_uppercase().as_str() {
@@ -1542,8 +1560,9 @@ async fn execute_request_with_data(
         "DELETE" => reqwest::Method::DELETE,
         "PATCH" => reqwest::Method::PATCH,
         _ => {
-            let msg = format!("交易接口：{}，警告: 未知的HTTP方法 '{}', 使用GET", gateway_name, method);
-            let _ = Python::attach(|py| call_write_log(py, &msg));
+            PYTHON_EXECUTOR.write_log(format!(
+                "交易接口：{}，警告: 未知的HTTP方法 '{}', 使用GET", gateway_name, method
+            ));
             reqwest::Method::GET
         }
     };
@@ -1581,8 +1600,9 @@ async fn execute_request_with_data(
                     req_builder = req_builder.json(&json_value);
                 }
                 Err(e) => {
-                    let msg = format!("交易接口：{}，JSON解析失败: {}, 使用原始字符串", gateway_name, e);
-                    let _ = Python::attach(|py| call_write_log(py, &msg));
+                    PYTHON_EXECUTOR.write_log(format!(
+                        "交易接口：{}，JSON解析失败: {}, 使用原始字符串", gateway_name, e
+                    ));
                     req_builder = req_builder
                         .header("Content-Type", "application/json")
                         .body(data);
@@ -1593,25 +1613,21 @@ async fn execute_request_with_data(
                 .header("Content-Type", "application/json")
                 .body(data);
         }
-    } else {
     }
 
     // 发送请求
     let response = match req_builder.send().await {
-        Ok(resp) => {
-            resp
-        }
+        Ok(resp) => resp,
         Err(e) => {
-            let msgs = vec![
-                format!("交易接口：{}，✗ 请求发送失败!", gateway_name),
-                format!("交易接口：{}，错误类型: {:?}", gateway_name, e),
-                format!("交易接口：{}，错误信息: {}", gateway_name, e),
-            ];
-            let _ = Python::attach(|py| {
-                for msg in &msgs {
-                    let _ = call_write_log(py, msg);
-                }
-            });
+            PYTHON_EXECUTOR.write_log(format!(
+                "交易接口：{}，✗ 请求发送失败!", gateway_name
+            ));
+            PYTHON_EXECUTOR.write_log(format!(
+                "交易接口：{}，错误类型: {:?}", gateway_name, e
+            ));
+            PYTHON_EXECUTOR.write_log(format!(
+                "交易接口：{}，错误信息: {}", gateway_name, e
+            ));
             return Err(Box::new(e));
         }
     };
@@ -1626,12 +1642,11 @@ async fn execute_request_with_data(
     }
     
     let response_text = match response.text().await {
-        Ok(text) => {
-            text
-        }
+        Ok(text) => text,
         Err(e) => {
-            let msg = format!("交易接口：{}，✗ 响应body读取失败: {}", gateway_name, e);
-            let _ = Python::attach(|py| call_write_log(py, &msg));
+            PYTHON_EXECUTOR.write_log(format!(
+                "交易接口：{}，✗ 响应body读取失败: {}", gateway_name, e
+            ));
             return Err(Box::new(e));
         }
     };
@@ -1640,19 +1655,14 @@ async fn execute_request_with_data(
         Value::Object(serde_json::Map::new())
     } else {
         match serde_json::from_str(&response_text) {
-            Ok(json) => {
-                json
-            }
+            Ok(json) => json,
             Err(e) => {
-                let msgs = vec![
-                    format!("交易接口：{}，✗ JSON解析失败: {}, 返回包含原始文本的对象", gateway_name, e),
-                    format!("交易接口：{}，原始响应文本: {}", gateway_name, response_text),
-                ];
-                let _ = Python::attach(|py| {
-                    for msg in &msgs {
-                        let _ = call_write_log(py, msg);
-                    }
-                });
+                PYTHON_EXECUTOR.write_log(format!(
+                    "交易接口：{}，✗ JSON解析失败: {}, 返回包含原始文本的对象", gateway_name, e
+                ));
+                PYTHON_EXECUTOR.write_log(format!(
+                    "交易接口：{}，原始响应文本: {}", gateway_name, response_text
+                ));
                 let mut map = serde_json::Map::new();
                 map.insert("text".to_string(), Value::String(response_text.clone()));
                 Value::Object(map)
@@ -1662,6 +1672,7 @@ async fn execute_request_with_data(
 
     Ok((status_code, response_text, json_body, response_headers))
 }
+
 
 fn handle_failed_response(
     py: Python,
@@ -1721,18 +1732,17 @@ fn handle_error_response(
     py: Python,
     error_msg: &str,
     request_guard: &Py<Request>,
-    _gateway_name: &str,
+    gateway_name: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let now = Local::now().format("%Y-%m-%dT%H:%M:%S%.6f");
-    
+
     let request_str = {
         let request = request_guard.bind(py).borrow();
         request.__str__()
     };
     
     let text = format!(
-        "[{}]：Unhandled RestClient Error：Exception\nrequest：{}\nException trace：\n{}\n",
-        now,
+        "交易接口：{}，Unhandled RestClient Error：Exception\nrequest：{}\nException trace：\n{}\n",
+        gateway_name,
         request_str,
         error_msg
     );
