@@ -72,7 +72,21 @@ pub struct Request {
     priority: i32,
     timeout_ms: u64,
 }
-
+fn pyany_to_param_string(value: &Bound<PyAny>) -> Option<String> {
+    if let Ok(v) = value.extract::<String>() {
+        Some(v)
+    } else if let Ok(i) = value.extract::<i64>() {
+        Some(i.to_string())
+    } else if let Ok(f) = value.extract::<f64>() {
+        Some(f.to_string())
+    } else if let Ok(b) = value.extract::<bool>() {
+        // Python requests 将 True/False 转为 "True"/"False"
+        if b { Some("True".to_string()) } else { Some("False".to_string()) }
+    } else {
+        // 对于其他类型，尝试转字符串
+        value.str().ok().map(|s| s.to_string())
+    }
+}
 #[pymethods]
 impl Request {
     #[new]
@@ -114,7 +128,6 @@ impl Request {
         
         let response_text = self.response_text.as_deref().unwrap_or("");
         
-        // Format headers, params, and data for display
         let headers_str = if let Some(ref headers) = self.headers {
             Python::attach(|py| {
                 headers.bind(py).repr().map(|s| s.to_string()).unwrap_or_else(|_| "{}".to_string())
@@ -140,7 +153,7 @@ impl Request {
         };
         
         format!(
-            "request：{} {} {} because {}：\nheaders：{}\nparams：{}\ndata：{}\nresponse：{}\n",
+            "request : {} {} {} because {}: \nheaders: {}\nparams: {}\ndata: {}\nresponse:{}\n",
             self.method,
             self.path,
             self.status.name(),
@@ -715,7 +728,7 @@ impl RestClient {
                 let mut retry_count = 0;
                 loop {
                     // 提取请求数据
-                    let (url, req_method, headers_data, query_params, body_data) = Python::attach(|py| {
+                    let (url, req_method, headers_data, query_params, body_data, is_jsonrpc) = Python::attach(|py| {
                         let request_ref = signed_request.borrow(py);
                         let path = request_ref.path.clone();
                         let req_method = request_ref.method.clone();
@@ -750,23 +763,30 @@ impl RestClient {
                             let params_obj = params_py.bind(py);
                             if let Ok(params_dict) = params_obj.cast::<PyDict>() {
                                 if params_dict.len() > 0 {
-                                    params_dict.iter()
-                                        .filter_map(|(key, value)| {
-                                            let k = key.extract::<String>().ok()?;
-                                            let v_str = if let Ok(v) = value.extract::<String>() {
-                                                v
-                                            } else if let Ok(i) = value.extract::<i64>() {
-                                                i.to_string()
-                                            } else if let Ok(f) = value.extract::<f64>() {
-                                                f.to_string()
-                                            } else if let Ok(b) = value.extract::<bool>() {
-                                                b.to_string()
-                                            } else {
-                                                value.str().ok()?.to_string()
-                                            };
-                                            Some((k, v_str))
-                                        })
-                                        .collect()
+                                    let mut params: Vec<(String, String)> = Vec::new();
+                                    
+                                    for (key, value) in params_dict.iter() {
+                                        let k = match key.extract::<String>() {
+                                            Ok(k) => k,
+                                            Err(_) => continue,
+                                        };
+                                        
+                                        // 检查值是否为 list
+                                        if let Ok(list) = value.cast::<PyList>() {
+                                            // 对于 list，为每个元素创建一个同名的键值对
+                                            for item in list.iter() {
+                                                if let Some(v_str) = pyany_to_param_string(&item) {
+                                                    params.push((k.clone(), v_str));
+                                                }
+                                            }
+                                        } else {
+                                            // 非 list 值，直接转换
+                                            if let Some(v_str) = pyany_to_param_string(&value) {
+                                                params.push((k, v_str));
+                                            }
+                                        }
+                                    }
+                                    params
                                 } else {
                                     vec![]
                                 }
@@ -778,40 +798,46 @@ impl RestClient {
                         };
                         
                         // 提取 body data
-                        let body_data = if let Some(data_py) = &request_ref.data {
+                        let (body_data, is_jsonrpc) = if let Some(data_py) = &request_ref.data {
                             let data_obj = data_py.bind(py);
                             if let Ok(data_str) = data_obj.extract::<String>() {
                                 if !data_str.is_empty() {
-                                    Some(data_str)
+                                    let is_jsonrpc = data_str.contains("jsonrpc");
+                                    (Some(data_str), is_jsonrpc)
                                 } else {
-                                    None
+                                    (None, false)
                                 }
                             } else if let Ok(data_dict) = data_obj.cast::<PyDict>() {
                                 if data_dict.len() > 0 {
-                                    pythondict_to_json_string(data_dict).ok()
+                                    let is_jsonrpc = data_dict.contains("jsonrpc").unwrap_or(false);
+                                    (pythondict_to_json_string(data_dict).ok(), is_jsonrpc)
                                 } else {
-                                    None
+                                    (None, false)
                                 }
                             } else if let Ok(data_bytes) = data_obj.cast::<PyBytes>() {
                                 let bytes = data_bytes.as_bytes();
                                 if !bytes.is_empty() {
-                                    Some(String::from_utf8_lossy(bytes).to_string())
+                                    let s = String::from_utf8_lossy(bytes).to_string();
+                                    let is_jsonrpc = s.contains("jsonrpc");
+                                    (Some(s), is_jsonrpc)
                                 } else {
-                                    None
+                                    (None, false)
                                 }
                             } else {
-                                data_obj.str().ok().map(|s| s.to_string())
+                                let s = data_obj.str().ok().map(|s| s.to_string());
+                                let is_jsonrpc = s.as_ref().map(|s| s.contains("jsonrpc")).unwrap_or(false);
+                                (s, is_jsonrpc)
                             }
                         } else {
-                            None
+                            (None, false)
                         };
-                        (url, req_method, headers_data, query_params, body_data)
+                        (url, req_method, headers_data, query_params, body_data, is_jsonrpc)
                     });
                     
                     // 执行 HTTP 请求
                     let result = timeout(
                         Duration::from_millis(config.request_timeout_ms),
-                        execute_request_with_data(&client, &req_method, &url, headers_data, query_params, body_data, &gateway_name)
+                        execute_request_with_data(&client, &req_method, &url, headers_data, query_params, body_data, is_jsonrpc, &gateway_name)
                     ).await;
                     
                     match result {
@@ -1413,7 +1439,7 @@ async fn execute_request_async_internal(
     config: &ClientConfig,
 ) -> Result<(u16, String, Value, IndexMap<String, String>), Box<dyn std::error::Error + Send + Sync>> { 
     
-    let (url, method, headers_data, query_params, body_data) = {
+    let (url, method, headers_data, query_params, body_data, is_jsonrpc) = {
         let request_guard = request_arc.read().await;
         Python::attach(|py| {
             let request = request_guard.borrow(py);
@@ -1422,7 +1448,6 @@ async fn execute_request_async_internal(
             let method = request.method.clone();
             let url = format!("{}{}", url_base, path);
             
-            // 提取 headers - 保持顺序
             let headers_data: Vec<(String, String)> = if let Some(headers_py) = &request.headers {
                 let headers = headers_py.bind(py);
                 headers.iter()
@@ -1446,28 +1471,34 @@ async fn execute_request_async_internal(
                 vec![]
             };
             
-            // 提取 params - 直接从 PyDict 提取，保持插入顺序
+            // 然后修改 params 提取逻辑 (在 execute_request_async_internal 和 request 方法中都需要修改)
             let query_params: Vec<(String, String)> = if let Some(params_py) = &request.params {
                 let params_obj = params_py.bind(py);
                 if let Ok(params_dict) = params_obj.cast::<PyDict>() {
                     if params_dict.len() > 0 {
-                        let params: Vec<_> = params_dict.iter()
-                            .filter_map(|(key, value)| {
-                                let k = key.extract::<String>().ok()?;
-                                let v_str = if let Ok(v) = value.extract::<String>() {
-                                    v
-                                } else if let Ok(i) = value.extract::<i64>() {
-                                    i.to_string()
-                                } else if let Ok(f) = value.extract::<f64>() {
-                                    f.to_string()
-                                } else if let Ok(b) = value.extract::<bool>() {
-                                    b.to_string()
-                                } else {
-                                    value.str().ok()?.to_string()
-                                };
-                                Some((k, v_str))
-                            })
-                            .collect();
+                        let mut params: Vec<(String, String)> = Vec::new();
+                        
+                        for (key, value) in params_dict.iter() {
+                            let k = match key.extract::<String>() {
+                                Ok(k) => k,
+                                Err(_) => continue,
+                            };
+                            
+                            // 检查值是否为 list
+                            if let Ok(list) = value.cast::<PyList>() {
+                                // 对于 list，为每个元素创建一个同名的键值对
+                                for item in list.iter() {
+                                    if let Some(v_str) = pyany_to_param_string(&item) {
+                                        params.push((k.clone(), v_str));
+                                    }
+                                }
+                            } else {
+                                // 非 list 值，直接转换
+                                if let Some(v_str) = pyany_to_param_string(&value) {
+                                    params.push((k, v_str));
+                                }
+                            }
+                        }
                         params
                     } else {
                         vec![]
@@ -1479,69 +1510,73 @@ async fn execute_request_async_internal(
                 vec![]
             };
 
-            // 提取 body data - 字典类型直接转JSON字符串，保持顺序
-            let body_data = if let Some(data_py) = &request.data {
+            // FIXED: Track is_jsonrpc based on dict keys, not string content
+            let (body_data, is_jsonrpc) = if let Some(data_py) = &request.data {
                 let data_obj = data_py.bind(py);
                 
                 if let Ok(data_str) = data_obj.extract::<String>() {
                     if !data_str.is_empty() {
-                        Some(data_str)
+                        let is_jsonrpc = data_str.contains("jsonrpc");
+                        (Some(data_str), is_jsonrpc)
                     } else {
-                        None
+                        (None, false)
                     }
                 } else if let Ok(data_dict) = data_obj.cast::<PyDict>() {
                     if data_dict.len() > 0 {
+                        // FIXED: Check if "jsonrpc" is a KEY in dict (Python behavior)
+                        let is_jsonrpc = data_dict.contains("jsonrpc").unwrap_or(false);
                         match pythondict_to_json_string(data_dict) {
-                            Ok(json_str) => Some(json_str),
+                            Ok(json_str) => (Some(json_str), is_jsonrpc),
                             Err(e) => {
                                 PYTHON_EXECUTOR.write_log(format!(
-                                        "交易接口：{}，Dict转JSON失败，错误信息： {}", 
-                                        gateway_name, e
-                                    ));
-                                None
+                                    "交易接口：{}，Dict转JSON失败，错误信息： {}", 
+                                    gateway_name, e
+                                ));
+                                (None, false)
                             }
                         }
                     } else {
-                        None
+                        (None, false)
                     }
                 } else if let Ok(data_bytes) = data_obj.cast::<PyBytes>() {
                     let bytes = data_bytes.as_bytes();
                     if !bytes.is_empty() {
                         let s = String::from_utf8_lossy(bytes).to_string();
-                        Some(s)
+                        let is_jsonrpc = s.contains("jsonrpc");
+                        (Some(s), is_jsonrpc)
                     } else {
-                        None
+                        (None, false)
                     }
                 } else {
                     match data_obj.str() {
                         Ok(s) => {
                             let s_str = s.to_string();
                             if !s_str.is_empty() && s_str != "None" {
-                                Some(s_str)
+                                let is_jsonrpc = s_str.contains("jsonrpc");
+                                (Some(s_str), is_jsonrpc)
                             } else {
-                                None
+                                (None, false)
                             }
                         }
                         Err(e) => {
                             PYTHON_EXECUTOR.write_log(format!(
-                                    "交易接口：{}，request.data转换失败，错误信息：{}", 
-                                    gateway_name, e
-                                ));
-                            None
+                                "交易接口：{}，request.data转换失败，错误信息：{}", 
+                                gateway_name, e
+                            ));
+                            (None, false)
                         }
                     }
                 }
             } else {
-                None
+                (None, false)
             };
 
-            (url, method, headers_data, query_params, body_data)
+            (url, method, headers_data, query_params, body_data, is_jsonrpc)
         })
     };
 
-    execute_request_with_data(client, &method, &url, headers_data, query_params, body_data, gateway_name).await
+    execute_request_with_data(client, &method, &url, headers_data, query_params, body_data, is_jsonrpc, gateway_name).await
 }
-
 
 async fn execute_request_with_data(
     client: &Client,
@@ -1550,6 +1585,7 @@ async fn execute_request_with_data(
     headers_data: Vec<(String, String)>,
     query_params: Vec<(String, String)>,
     body_data: Option<String>,
+    is_jsonrpc: bool,  // NEW parameter
     gateway_name: &str,
 ) -> Result<(u16, String, Value, IndexMap<String, String>), Box<dyn std::error::Error + Send + Sync>> {
     
@@ -1569,7 +1605,6 @@ async fn execute_request_with_data(
 
     let mut req_builder = client.request(http_method.clone(), url);
 
-    // 添加headers
     for (k, v) in headers_data.iter() {
         match (
             k.parse::<reqwest::header::HeaderName>(),
@@ -1587,14 +1622,14 @@ async fn execute_request_with_data(
         }
     }
 
-    // 添加query参数
     if !query_params.is_empty() {
         req_builder = req_builder.query(&query_params);
     }
 
-    // 处理body data
+    // FIXED: Handle body data exactly like Python does
     if let Some(data) = body_data {
-        if data.contains("jsonrpc") {
+        if is_jsonrpc {
+            // jsonrpc: use json parameter (like Python's json= parameter)
             match serde_json::from_str::<Value>(&data) {
                 Ok(json_value) => {
                     req_builder = req_builder.json(&json_value);
@@ -1609,13 +1644,13 @@ async fn execute_request_with_data(
                 }
             }
         } else {
+            // non-jsonrpc: use data parameter
             req_builder = req_builder
                 .header("Content-Type", "application/json")
                 .body(data);
         }
     }
 
-    // 发送请求
     let response = match req_builder.send().await {
         Ok(resp) => resp,
         Err(e) => {
