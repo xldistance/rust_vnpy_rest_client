@@ -72,6 +72,7 @@ pub struct Request {
     priority: i32,
     timeout_ms: u64,
 }
+
 fn pyany_to_param_string(value: &Bound<PyAny>) -> Option<String> {
     if let Ok(v) = value.extract::<String>() {
         Some(v)
@@ -87,6 +88,7 @@ fn pyany_to_param_string(value: &Bound<PyAny>) -> Option<String> {
         value.str().ok().map(|s| s.to_string())
     }
 }
+
 #[pymethods]
 impl Request {
     #[new]
@@ -194,34 +196,22 @@ pub struct ClientConfig {
     pool_timeout_ms: u64,
     max_retries: usize,
     retry_delay_ms: u64,
-    batch_size: usize
+    batch_size: usize,
+    semaphore_acquire_timeout_ms: u64,  // 新增：信号量获取超时
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            // 最大连接数（通常指连接池的大小），限制客户端同时保持的 TCP 连接数量
             max_connections: 100,
-            
-            // 最大并发请求数，限制同时正在执行的异步请求任务数量（通常用于信号量控制以防止系统过载）
             max_concurrent_requests: 1000,
-            
-            // 请求超时时间（毫秒），指从发送请求到接收完响应数据的总最长等待时间（此处为5秒）
             request_timeout_ms: 5000,
-            
-            // 连接超时时间（毫秒），指与服务器建立 TCP 连接（握手）的最长等待时间（此处为5秒）
             connect_timeout_ms: 5000,
-            
-            // 连接池空闲超时时间（毫秒），指一个空闲连接在被关闭前可以在池中保留的时间（此处为5秒）
             pool_timeout_ms: 5000,
-            
-            // 最大重试次数，当请求失败（如超时或网络错误）时尝试重新发送的次数
             max_retries: 3,
-            
-            // 重试延迟时间（毫秒），在下一次重试之前等待的时间间隔（此处为1秒）
             retry_delay_ms: 1000,
-            // 批处理大小
-            batch_size:50,
+            batch_size: 50,
+            semaphore_acquire_timeout_ms: 30000,  // 30秒超时
         }
     }
 }
@@ -249,44 +239,38 @@ enum PythonTask {
         exception_value: String,
         request: Option<Py<Request>>,
     },
-    // 新增日志任务
     WriteLog {
         message: String,
     },
-    // 新增保存连接状态任务
     SaveConnectionStatus {
         gateway_name: String,
         status: bool,
     },
 }
 
-
 /// Python 操作执行器
 struct PythonExecutor {
-    task_tx: mpsc::UnboundedSender<PythonTask>,
+    task_tx: mpsc::Sender<PythonTask>,  // 修改为有界通道
     _handle: std::thread::JoinHandle<()>,
 }
 
 impl PythonExecutor {
     fn new() -> Self {
-        let (task_tx, mut task_rx) = mpsc::unbounded_channel::<PythonTask>();
+        // 使用有界通道，防止内存无限增长
+        let (task_tx, mut task_rx) = mpsc::channel::<PythonTask>(10000);
         
-        // 在独立线程中创建多线程 runtime，避免初始化时的 runtime 依赖
         let handle = std::thread::spawn(move || {
-            // 使用多线程 runtime 以支持更好的并发
             let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(std::cmp::min(num_cpus::get(), 8))  // 可以根据需要调整
+                .worker_threads(std::cmp::min(num_cpus::get(), 8))
                 .thread_name("python-executor")
                 .enable_all()
                 .build()
                 .expect("Failed to create Python executor runtime");
             
-            // 创建专用的线程池用于 Python 操作
             let python_pool = std::sync::Arc::new(
                 threadpool::ThreadPool::with_name("python-ops".to_string(), 4)
             );
             
-            // 在这个 runtime 中运行任务处理循环
             rt.block_on(async move {
                 while let Some(task) = task_rx.recv().await {
                     let pool = python_pool.clone();
@@ -364,7 +348,8 @@ impl PythonExecutor {
             task_tx,
             _handle: handle,
         }
-    }    
+    }
+    
     /// 异步调用 Python sign 方法
     async fn sign_async(&self, client: Py<RestClient>, request: Py<Request>) -> PyResult<Py<Request>> {
         let (response_tx, response_rx) = oneshot::channel();
@@ -373,7 +358,7 @@ impl PythonExecutor {
             client,
             request,
             response_tx,
-        }).map_err(|_| PyRuntimeError::new_err("发送签名任务失败"))?;
+        }).await.map_err(|_| PyRuntimeError::new_err("发送签名任务失败"))?;
         
         response_rx.await
             .map_err(|_| PyRuntimeError::new_err("未收到签名响应"))?
@@ -385,7 +370,7 @@ impl PythonExecutor {
             callback,
             data,
             request,
-        });
+        }).await;
     }
     
     /// 异步调用 Python on_failed
@@ -394,7 +379,7 @@ impl PythonExecutor {
             callback,
             status_code,
             request,
-        });
+        }).await;
     }
     
     /// 异步调用 Python on_error  
@@ -404,20 +389,19 @@ impl PythonExecutor {
             exception_type,
             exception_value,
             request,
-        });
+        }).await;
     }
     
-    /// 异步写日志（不阻塞）
+    /// 异步写日志（不阻塞）- 使用 try_send 避免阻塞
     fn write_log(&self, message: String) {
-        let _ = self.task_tx.send(PythonTask::WriteLog { message });
+        let _ = self.task_tx.try_send(PythonTask::WriteLog { message });
     }
     
-    /// 异步保存连接状态（不阻塞）
+    /// 异步保存连接状态（不阻塞）- 使用 try_send 避免阻塞
     fn save_connection_status(&self, gateway_name: String, status: bool) {
-        let _ = self.task_tx.send(PythonTask::SaveConnectionStatus { gateway_name, status });
+        let _ = self.task_tx.try_send(PythonTask::SaveConnectionStatus { gateway_name, status });
     }
 }
-
 
 // 全局 Python 执行器
 static PYTHON_EXECUTOR: Lazy<PythonExecutor> = Lazy::new(|| PythonExecutor::new());
@@ -433,7 +417,7 @@ pub struct RestClient {
     semaphore: Arc<Semaphore>,
     runtime: Arc<tokio::runtime::Runtime>,
     client_key: String,
-    proxies: Option<IndexMap<String, String>>,  // HashMap -> IndexMap
+    proxies: Option<IndexMap<String, String>>,
     self_py: Option<Py<RestClient>>,
 }
 
@@ -453,13 +437,11 @@ impl RestClient {
                 .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {}", e)))?
         );
 
-        // 确保 semaphore 正确初始化
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
         
-        // 验证 semaphore 初始化 - 使用 PYTHON_EXECUTOR 避免死锁
         let available = semaphore.available_permits();
         PYTHON_EXECUTOR.write_log(format!(
-            "Semaphore初始化完成，可用许可: {}", 
+            "Semaphore初始化完成，最大并发: {}", 
             available
         ));
 
@@ -477,7 +459,6 @@ impl RestClient {
         })
     }
 
-    
     #[pyo3(signature = (url_base, proxy_host="", proxy_port=0, gateway_name=""))]
     fn init(
         &mut self,
@@ -489,10 +470,9 @@ impl RestClient {
         self.url_base = url_base.clone();
         self.gateway_name = gateway_name.to_string();
         
-        // 设置代理
         if !proxy_host.is_empty() && proxy_port > 0 {
             let proxy = format!("http://{}:{}", proxy_host, proxy_port);
-            let mut proxies = IndexMap::new();  // HashMap -> IndexMap
+            let mut proxies = IndexMap::new();
             proxies.insert("http".to_string(), proxy.clone());
             proxies.insert("https".to_string(), proxy);
             self.proxies = Some(proxies);
@@ -510,7 +490,6 @@ impl RestClient {
             gateway_name.to_string()
         };
 
-        // 创建并缓存HTTP客户端
         let client = self.runtime.block_on(async {
             create_simple_client(
                 if !proxy_host.is_empty() && proxy_port > 0 {
@@ -519,7 +498,7 @@ impl RestClient {
                     None
                 },
                 &self.config,
-                gateway_name,  // 添加此参数
+                gateway_name,
             ).await
         })?;
 
@@ -553,13 +532,11 @@ impl RestClient {
         let config = self_mut.config.clone();
         let runtime = Arc::clone(&self_mut.runtime);
         
-        // 存储 self 的 Python 引用
         let py = slf.py();
         let rest_client_py = slf.clone().unbind();
         self_mut.self_py = Some(rest_client_py.clone_ref(py));
 
         runtime.spawn(async move {
-            
             run_async_worker(
                 receiver,
                 gateway_name,
@@ -570,7 +547,6 @@ impl RestClient {
                 url_base,
                 rest_client_py,
             ).await;
-        
         });
 
         Ok(())
@@ -578,6 +554,8 @@ impl RestClient {
 
     fn stop(&mut self) -> PyResult<()> {
         self.active.store(false, Ordering::SeqCst);
+        // 关闭发送通道，让 worker 能够优雅退出
+        self.sender = None;
         Ok(())
     }
 
@@ -625,7 +603,6 @@ impl RestClient {
 
         let self_ref = slf.borrow();
         if let Some(sender) = &self_ref.sender {
-            // 直接发送未签名的请求，签名将在异步worker中完成
             let request_arc = Arc::new(RwLock::new(request.clone_ref(py)));
             sender.send(request_arc).map_err(|e| {
                 PyRuntimeError::new_err(format!("Failed to send request: {}", e))
@@ -636,11 +613,9 @@ impl RestClient {
     }
 
     fn sign<'py>(&self, request: Bound<'py, Request>) -> PyResult<Bound<'py, Request>> {
-        // 基础实现 - 子类应该重写此方法
         Ok(request)
     }
 
-    // 在 RestClient 的 #[pymethods] 块中添加以下方法
     #[pyo3(signature = (method, path, params=None, data=None, headers=None))]
     fn request(
         slf: &Bound<'_, Self>,
@@ -694,195 +669,93 @@ impl RestClient {
         
         drop(self_ref);
         
+        // 使用 handle 来避免嵌套 runtime 问题
+        let handle = runtime.handle().clone();
+        
         py.detach(move || {
-            runtime.block_on(async {
-                // 签名阶段
-                let signed_request = tokio::task::spawn_blocking(move || {
-                    Python::attach(|py| -> PyResult<Py<Request>> {
-                        let result = rest_client_py.bind(py).call_method1("sign", (request.bind(py),))?;
-                        Ok(result.extract::<Py<Request>>()?)
-                    })
-                }).await;
+            // 在新线程中执行异步操作，避免嵌套 runtime
+            std::thread::scope(|_| {
+                handle.block_on(async {
+                    // 签名阶段
+                    let signed_request = tokio::task::spawn_blocking(move || {
+                        Python::attach(|py| -> PyResult<Py<Request>> {
+                            let result = rest_client_py.bind(py).call_method1("sign", (request.bind(py),))?;
+                            Ok(result.extract::<Py<Request>>()?)
+                        })
+                    }).await;
 
-                let signed_request = match signed_request {
-                    Ok(Ok(s)) => s,
-                    Ok(Err(e)) => return Err(PyRuntimeError::new_err(format!("交易接口：{}，签名失败，错误信息： {}", gateway_name, e))),
-                    Err(e) => return Err(PyRuntimeError::new_err(format!("Signing task failed: {}", e))),
-                };
+                    let signed_request = match signed_request {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => return Err(PyRuntimeError::new_err(format!("交易接口：{}，签名失败，错误信息： {}", gateway_name, e))),
+                        Err(e) => return Err(PyRuntimeError::new_err(format!("Signing task failed: {}", e))),
+                    };
 
-                // 获取客户端
-                let client = match CLIENT_POOL.get(&client_key) {
-                    Some(c) => c.clone(),
-                    None => {
-                        let error_msg = "HTTP client not found";
-                        PYTHON_EXECUTOR.write_log(format!(
-                            "交易接口：{}，REST API创建出错，错误信息：{}，重启交易子进程", 
-                            gateway_name, error_msg
-                        ));
-                        PYTHON_EXECUTOR.save_connection_status(gateway_name.clone(), false);
-                        return Err(PyRuntimeError::new_err(error_msg));
-                    }
-                };
+                    let client = match CLIENT_POOL.get(&client_key) {
+                        Some(c) => c.clone(),
+                        None => {
+                            let error_msg = "HTTP client not found";
+                            PYTHON_EXECUTOR.write_log(format!(
+                                "交易接口：{}，REST API创建出错，错误信息：{}，重启交易子进程", 
+                                gateway_name, error_msg
+                            ));
+                            PYTHON_EXECUTOR.save_connection_status(gateway_name.clone(), false);
+                            return Err(PyRuntimeError::new_err(error_msg));
+                        }
+                    };
 
-                // 执行请求（带重试）
-                let mut retry_count = 0;
-                loop {
-                    // 提取请求数据
-                    let (url, req_method, headers_data, query_params, body_data, is_jsonrpc) = Python::attach(|py| {
-                        let request_ref = signed_request.borrow(py);
-                        let path = request_ref.path.clone();
-                        let req_method = request_ref.method.clone();
-                        let url = format!("{}{}", url_base, path);
+                    let mut retry_count = 0;
+                    loop {
+                        let (url, req_method, headers_data, query_params, body_data, is_jsonrpc) = 
+                            extract_request_data(&signed_request, &url_base, &gateway_name);
                         
-                        // 提取 headers
-                        let headers_data: Vec<(String, String)> = if let Some(headers_py) = &request_ref.headers {
-                            let headers = headers_py.bind(py);
-                            headers.iter()
-                                .filter_map(|(key, value)| {
-                                    let key_str = key.extract::<String>().ok()?;
-                                    let value_str = if let Ok(v) = value.extract::<String>() {
-                                        v
-                                    } else if let Ok(i) = value.extract::<i64>() {
-                                        i.to_string()
-                                    } else if let Ok(f) = value.extract::<f64>() {
-                                        f.to_string()
-                                    } else if let Ok(b) = value.extract::<bool>() {
-                                        b.to_string()
-                                    } else {
-                                        value.str().ok()?.to_string()
-                                    };
-                                    Some((key_str, value_str))
-                                })
-                                .collect()
-                        } else {
-                            vec![]
-                        };
+                        let result = timeout(
+                            Duration::from_millis(config.request_timeout_ms),
+                            execute_request_with_data(&client, &req_method, &url, headers_data, query_params, body_data, is_jsonrpc, &gateway_name)
+                        ).await;
                         
-                        // 提取 params
-                        let query_params: Vec<(String, String)> = if let Some(params_py) = &request_ref.params {
-                            let params_obj = params_py.bind(py);
-                            if let Ok(params_dict) = params_obj.cast::<PyDict>() {
-                                if params_dict.len() > 0 {
-                                    let mut params: Vec<(String, String)> = Vec::new();
-                                    
-                                    for (key, value) in params_dict.iter() {
-                                        let k = match key.extract::<String>() {
-                                            Ok(k) => k,
-                                            Err(_) => continue,
-                                        };
-                                        
-                                        // 检查值是否为 list
-                                        if let Ok(list) = value.cast::<PyList>() {
-                                            // 对于 list，为每个元素创建一个同名的键值对
-                                            for item in list.iter() {
-                                                if let Some(v_str) = pyany_to_param_string(&item) {
-                                                    params.push((k.clone(), v_str));
-                                                }
-                                            }
-                                        } else {
-                                            // 非 list 值，直接转换
-                                            if let Some(v_str) = pyany_to_param_string(&value) {
-                                                params.push((k, v_str));
-                                            }
-                                        }
+                        match result {
+                            Ok(Ok((status_code, response_text, _json_body, response_headers))) => {
+                                return Python::attach(|py| {
+                                    let headers_dict = PyDict::new(py);
+                                    for (key, value) in response_headers.iter() {
+                                        headers_dict.set_item(key, value)?;
                                     }
-                                    params
-                                } else {
-                                    vec![]
-                                }
-                            } else {
-                                vec![]
+                                    Py::new(py, PyResponseObject {
+                                        status_code,
+                                        text: response_text,
+                                        headers: headers_dict.unbind(),
+                                    })
+                                });
                             }
-                        } else {
-                            vec![]
-                        };
-                        
-                        // 提取 body data
-                        let (body_data, is_jsonrpc) = if let Some(data_py) = &request_ref.data {
-                            let data_obj = data_py.bind(py);
-                            if let Ok(data_str) = data_obj.extract::<String>() {
-                                if !data_str.is_empty() {
-                                    let is_jsonrpc = data_str.contains("jsonrpc");
-                                    (Some(data_str), is_jsonrpc)
-                                } else {
-                                    (None, false)
+                            Ok(Err(e)) => {
+                                retry_count += 1;
+                                if retry_count >= config.max_retries {
+                                    let error_msg = format!("经过{}次重试后REST API连接失败，错误信息：{}", config.max_retries, e);
+                                    PYTHON_EXECUTOR.write_log(format!(
+                                        "交易接口：{}，REST API连接出错，错误信息：{}，重启交易子进程", 
+                                        gateway_name, error_msg
+                                    ));
+                                    PYTHON_EXECUTOR.save_connection_status(gateway_name.clone(), false);
+                                    return Err(PyRuntimeError::new_err(error_msg));
                                 }
-                            } else if let Ok(data_dict) = data_obj.cast::<PyDict>() {
-                                if data_dict.len() > 0 {
-                                    let is_jsonrpc = data_dict.contains("jsonrpc").unwrap_or(false);
-                                    (pythondict_to_json_string(data_dict).ok(), is_jsonrpc)
-                                } else {
-                                    (None, false)
-                                }
-                            } else if let Ok(data_bytes) = data_obj.cast::<PyBytes>() {
-                                let bytes = data_bytes.as_bytes();
-                                if !bytes.is_empty() {
-                                    let s = String::from_utf8_lossy(bytes).to_string();
-                                    let is_jsonrpc = s.contains("jsonrpc");
-                                    (Some(s), is_jsonrpc)
-                                } else {
-                                    (None, false)
-                                }
-                            } else {
-                                let s = data_obj.str().ok().map(|s| s.to_string());
-                                let is_jsonrpc = s.as_ref().map(|s| s.contains("jsonrpc")).unwrap_or(false);
-                                (s, is_jsonrpc)
+                                tokio::time::sleep(Duration::from_millis(config.retry_delay_ms)).await;
                             }
-                        } else {
-                            (None, false)
-                        };
-                        (url, req_method, headers_data, query_params, body_data, is_jsonrpc)
-                    });
-                    
-                    // 执行 HTTP 请求
-                    let result = timeout(
-                        Duration::from_millis(config.request_timeout_ms),
-                        execute_request_with_data(&client, &req_method, &url, headers_data, query_params, body_data, is_jsonrpc, &gateway_name)
-                    ).await;
-                    
-                    match result {
-                        Ok(Ok((status_code, response_text, _json_body, response_headers))) => {
-                            // 请求成功，创建响应对象
-                            return Python::attach(|py| {
-                                let headers_dict = PyDict::new(py);
-                                for (key, value) in response_headers.iter() {
-                                    headers_dict.set_item(key, value)?;
+                            Err(_) => {
+                                retry_count += 1;
+                                if retry_count >= config.max_retries {
+                                    let error_msg = format!("请求超时，重试 {} 次后仍未成功", config.max_retries);
+                                    PYTHON_EXECUTOR.write_log(format!(
+                                        "交易接口：{}，REST API连接出错，错误信息：{}，重启交易子进程", 
+                                        gateway_name, error_msg
+                                    ));
+                                    PYTHON_EXECUTOR.save_connection_status(gateway_name.clone(), false);
+                                    return Err(PyRuntimeError::new_err(error_msg));
                                 }
-                                Py::new(py, PyResponseObject {
-                                    status_code,
-                                    text: response_text,
-                                    headers: headers_dict.unbind(),
-                                })
-                            });
-                        }
-                        Ok(Err(e)) => {
-                            retry_count += 1;
-                            if retry_count >= config.max_retries {
-                                let error_msg = format!("经过{}次重试后REST API连接失败，错误信息：{}", config.max_retries, e);
-                                PYTHON_EXECUTOR.write_log(format!(
-                                    "交易接口：{}，REST API连接出错，错误信息：{}，重启交易子进程", 
-                                    gateway_name, error_msg
-                                ));
-                                PYTHON_EXECUTOR.save_connection_status(gateway_name.clone(), false);
-                                return Err(PyRuntimeError::new_err(error_msg));
+                                tokio::time::sleep(Duration::from_millis(config.retry_delay_ms)).await;
                             }
-                            tokio::time::sleep(Duration::from_millis(config.retry_delay_ms)).await;
-                        }
-                        Err(_) => {
-                            retry_count += 1;
-                            if retry_count >= config.max_retries {
-                                let error_msg = format!("请求超时，重试 {} 次后仍未成功", config.max_retries);
-                                PYTHON_EXECUTOR.write_log(format!(
-                                    "交易接口：{}，REST API连接出错，错误信息：{}，重启交易子进程", 
-                                    gateway_name, error_msg
-                                ));
-                                PYTHON_EXECUTOR.save_connection_status(gateway_name.clone(), false);
-                                return Err(PyRuntimeError::new_err(error_msg));
-                            }
-                            tokio::time::sleep(Duration::from_millis(config.retry_delay_ms)).await;
                         }
                     }
-                }
+                })
             })
         })
     }
@@ -940,11 +813,9 @@ impl RestClient {
         let req = request.borrow();
         
         if let Some(response_text) = &req.response_text {
-            // 尝试解码JSON，就像Python中的实现
             match serde_json::from_str::<Value>(response_text) {
                 Ok(data) => {
                     if let Some(msg) = data.get("msg").and_then(|v| v.as_str()) {
-                        //过滤OKX请求超时错误和币安重复设置持仓模式错误
                         let filter_msg = vec![
                             "Endpoint request timeout. ",
                             "No need to change position side.",
@@ -955,7 +826,6 @@ impl RestClient {
                     }
                 }
                 Err(_) => {
-                    // JSON解码错误，记录日志
                     call_write_log(
                         py,
                         &format!(
@@ -1011,7 +881,113 @@ impl RestClient {
     }
 }
 
-
+/// 提取请求数据的辅助函数，避免在异步上下文中长时间持有 GIL
+fn extract_request_data(
+    signed_request: &Py<Request>,
+    url_base: &str,
+    gateway_name: &str,
+) -> (String, String, Vec<(String, String)>, Vec<(String, String)>, Option<String>, bool) {
+    Python::attach(|py| {
+        let request_ref = signed_request.borrow(py);
+        let path = request_ref.path.clone();
+        let req_method = request_ref.method.clone();
+        let url = format!("{}{}", url_base, path);
+        
+        let headers_data: Vec<(String, String)> = if let Some(headers_py) = &request_ref.headers {
+            let headers = headers_py.bind(py);
+            headers.iter()
+                .filter_map(|(key, value)| {
+                    let key_str = key.extract::<String>().ok()?;
+                    let value_str = if let Ok(v) = value.extract::<String>() {
+                        v
+                    } else if let Ok(i) = value.extract::<i64>() {
+                        i.to_string()
+                    } else if let Ok(f) = value.extract::<f64>() {
+                        f.to_string()
+                    } else if let Ok(b) = value.extract::<bool>() {
+                        b.to_string()
+                    } else {
+                        value.str().ok()?.to_string()
+                    };
+                    Some((key_str, value_str))
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        
+        let query_params: Vec<(String, String)> = if let Some(params_py) = &request_ref.params {
+            let params_obj = params_py.bind(py);
+            if let Ok(params_dict) = params_obj.cast::<PyDict>() {
+                if params_dict.len() > 0 {
+                    let mut params: Vec<(String, String)> = Vec::new();
+                    
+                    for (key, value) in params_dict.iter() {
+                        let k = match key.extract::<String>() {
+                            Ok(k) => k,
+                            Err(_) => continue,
+                        };
+                        
+                        if let Ok(list) = value.cast::<PyList>() {
+                            for item in list.iter() {
+                                if let Some(v_str) = pyany_to_param_string(&item) {
+                                    params.push((k.clone(), v_str));
+                                }
+                            }
+                        } else {
+                            if let Some(v_str) = pyany_to_param_string(&value) {
+                                params.push((k, v_str));
+                            }
+                        }
+                    }
+                    params
+                } else {
+                    vec![]
+                }
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+        
+        let (body_data, is_jsonrpc) = if let Some(data_py) = &request_ref.data {
+            let data_obj = data_py.bind(py);
+            if let Ok(data_str) = data_obj.extract::<String>() {
+                if !data_str.is_empty() {
+                    let is_jsonrpc = data_str.contains("jsonrpc");
+                    (Some(data_str), is_jsonrpc)
+                } else {
+                    (None, false)
+                }
+            } else if let Ok(data_dict) = data_obj.cast::<PyDict>() {
+                if data_dict.len() > 0 {
+                    let is_jsonrpc = data_dict.contains("jsonrpc").unwrap_or(false);
+                    (pythondict_to_json_string(data_dict).ok(), is_jsonrpc)
+                } else {
+                    (None, false)
+                }
+            } else if let Ok(data_bytes) = data_obj.cast::<PyBytes>() {
+                let bytes = data_bytes.as_bytes();
+                if !bytes.is_empty() {
+                    let s = String::from_utf8_lossy(bytes).to_string();
+                    let is_jsonrpc = s.contains("jsonrpc");
+                    (Some(s), is_jsonrpc)
+                } else {
+                    (None, false)
+                }
+            } else {
+                let s = data_obj.str().ok().map(|s| s.to_string());
+                let is_jsonrpc = s.as_ref().map(|s| s.contains("jsonrpc")).unwrap_or(false);
+                (s, is_jsonrpc)
+            }
+        } else {
+            (None, false)
+        };
+        
+        (url, req_method, headers_data, query_params, body_data, is_jsonrpc)
+    })
+}
 
 /// 创建简化的HTTP客户端
 async fn create_simple_client(
@@ -1058,8 +1034,6 @@ async fn create_simple_client(
         }
     }
 }
-
-
 
 /// 高并发异步工作器
 async fn run_async_worker(
@@ -1113,25 +1087,27 @@ async fn run_async_worker(
         let should_process = should_process || last_batch_time.elapsed() >= BATCH_TIMEOUT;
 
         if should_process && !batch.is_empty() {
-
-            // 按优先级排序
-            batch.sort_by(|a, b| {
-                let a_priority = Python::attach(|py| {
-                    if let Ok(req) = a.try_read() {
-                        req.borrow(py).priority
+            // 按优先级排序 - 使用 block_in_place 避免在异步上下文中直接调用 Python::attach
+            let priorities: Vec<i32> = {
+                let mut prios = Vec::with_capacity(batch.len());
+                for req_arc in batch.iter() {
+                    let priority = if let Ok(req) = req_arc.try_read() {
+                        tokio::task::block_in_place(|| {
+                            Python::attach(|py| req.borrow(py).priority)
+                        })
                     } else {
                         0
-                    }
-                });
-                let b_priority = Python::attach(|py| {
-                    if let Ok(req) = b.try_read() {
-                        req.borrow(py).priority
-                    } else {
-                        0
-                    }
-                });
-                b_priority.cmp(&a_priority)
+                    };
+                    prios.push(priority);
+                }
+                prios
+            };
+            
+            let mut indexed_batch: Vec<_> = batch.drain(..).enumerate().collect();
+            indexed_batch.sort_by(|(i, _), (j, _)| {
+                priorities.get(*j).unwrap_or(&0).cmp(priorities.get(*i).unwrap_or(&0))
             });
+            batch = indexed_batch.into_iter().map(|(_, req)| req).collect();
 
             if let Some(client) = CLIENT_POOL.get(&client_key) {
                 let client = client.clone();
@@ -1143,18 +1119,33 @@ async fn run_async_worker(
                     let config_clone = config.clone();
                     let rest_client_clone = Python::attach(|py| rest_client.clone_ref(py));
                     let semaphore_clone = semaphore.clone();
+                    let semaphore_timeout = config.semaphore_acquire_timeout_ms;
 
                     tokio::spawn(async move {
-                        let _permit = match semaphore_clone.acquire_owned().await {
-                            Ok(p) => p,
-                            Err(e) => {
+                        // 使用 select 来支持超时，避免信号量永久阻塞
+                        let permit = tokio::select! {
+                            biased;
+                            permit = semaphore_clone.acquire_owned() => {
+                                match permit {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        PYTHON_EXECUTOR.write_log(format!(
+                                            "交易接口：{}，信号量已关闭，丢弃请求: {}",
+                                            gateway_name_clone, e
+                                        ));
+                                        return;
+                                    }
+                                }
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(semaphore_timeout)) => {
                                 PYTHON_EXECUTOR.write_log(format!(
-                                    "交易接口：{}，信号量已关闭，丢弃请求: {}",
-                                    gateway_name_clone, e
+                                    "交易接口：{}，获取信号量超时({}ms)，丢弃请求",
+                                    gateway_name_clone, semaphore_timeout
                                 ));
                                 return;
                             }
                         };
+                        let _permit = permit;
 
                         if let Err(e) = process_request_async(
                             request_arc,
@@ -1178,12 +1169,11 @@ async fn run_async_worker(
                     gateway_name,
                     client_key
                 ));
-                // 重新将请求放回队列
                 if let Some(ref sender) = Python::attach(|py| {
                     rest_client.borrow(py).sender.clone()
                 }) {
                     for request_arc in batch.drain(..) {
-                        let _= sender.send(request_arc);
+                        let _ = sender.send(request_arc);
                     }
                 }
             }
@@ -1191,6 +1181,11 @@ async fn run_async_worker(
             last_batch_time = Instant::now();
         }
     }
+    
+    PYTHON_EXECUTOR.write_log(format!(
+        "交易接口：{}，异步worker已退出",
+        gateway_name
+    ));
 }
 
 /// 异步处理单个请求
@@ -1207,6 +1202,7 @@ async fn process_request_async(
     let signed_request = {
         let request_guard = request_arc.read().await;
         let request_py = Python::attach(|py| request_guard.clone_ref(py));
+        drop(request_guard);  // 释放锁再调用异步签名
         
         match PYTHON_EXECUTOR.sign_async(rest_client, request_py).await {
             Ok(signed) => signed,
@@ -1227,10 +1223,11 @@ async fn process_request_async(
 
     let timeout_duration = {
         let request_guard = request_arc.read().await;
-        Duration::from_millis(Python::attach(|py| {
+        let timeout_ms = Python::attach(|py| {
             let request = request_guard.borrow(py);
             request.timeout_ms
-        }))
+        });
+        Duration::from_millis(timeout_ms)
     };
 
     let mut retry_count = 0;
@@ -1245,12 +1242,13 @@ async fn process_request_async(
                 
                 // 特殊处理502状态码
                 if status_code == 502 {
-                    let request_guard = request_arc.read().await;
-                    let path = Python::attach(|py| {
-                        let request = request_guard.borrow(py);
-                        request.path.clone()
-                    });
-                    drop(request_guard);
+                    let path = {
+                        let request_guard = request_arc.read().await;
+                        Python::attach(|py| {
+                            let request = request_guard.borrow(py);
+                            request.path.clone()
+                        })
+                    };
                     
                     let msg = format!(
                         "交易接口：{}，REST API请求失败，请求地址：{}{}，错误代码：{}，错误信息：{}",
@@ -1265,41 +1263,40 @@ async fn process_request_async(
                     return Ok(());
                 }
                 
-                let request_guard = request_arc.write().await;
-                
-                let (callback_opt, on_failed_opt, should_handle_failed) = Python::attach(|py| -> Result<(Option<Py<PyAny>>, Option<Py<PyAny>>, bool), Box<dyn std::error::Error + Send + Sync>> {
-                    let mut request = request_guard.borrow_mut(py);
-                    request.status_code = Some(status_code);
-                    request.response_text = Some(response_text.clone());
-
-                    let headers_dict = PyDict::new(py);
-                    for (key, value) in response_headers.iter() {
-                        headers_dict.set_item(key, value)?;
-                    }
+                // 在单独的作用域内处理请求更新，避免跨 await 持有锁
+                let (callback_opt, on_failed_opt, should_handle_failed, request_py) = {
+                    let request_guard = request_arc.write().await;
                     
-                    let response_obj = PyResponseObject {
-                        status_code,
-                        text: response_text.clone(),
-                        headers: headers_dict.unbind(),
-                    };
-                    request.response = Some(Py::new(py, response_obj)?.into_any());
+                    Python::attach(|py| -> Result<(Option<Py<PyAny>>, Option<Py<PyAny>>, bool, Py<Request>), Box<dyn std::error::Error + Send + Sync>> {
+                        let mut request = request_guard.borrow_mut(py);
+                        request.status_code = Some(status_code);
+                        request.response_text = Some(response_text.clone());
 
-                    let is_success = status_code / 100 == 2;
-                    
-                    if is_success {
-                        request.status = RequestStatus::Success;
-                        Ok((request.callback.as_ref().map(|c| c.clone_ref(py)), None, false))
-                    } else {
-                        request.status = RequestStatus::Failed;
-                        let has_on_failed = request.on_failed.is_some();
-                        Ok((None, request.on_failed.as_ref().map(|f| f.clone_ref(py)), !has_on_failed))
-                    }
-                })?;
-                
-                let request_py = {
-                    drop(request_guard);
-                    let read_guard = request_arc.read().await;
-                    Python::attach(|py| read_guard.clone_ref(py))
+                        let headers_dict = PyDict::new(py);
+                        for (key, value) in response_headers.iter() {
+                            headers_dict.set_item(key, value)?;
+                        }
+                        
+                        let response_obj = PyResponseObject {
+                            status_code,
+                            text: response_text.clone(),
+                            headers: headers_dict.unbind(),
+                        };
+                        request.response = Some(Py::new(py, response_obj)?.into_any());
+
+                        let is_success = status_code / 100 == 2;
+                        
+                        let request_py_clone = request_guard.clone_ref(py);
+                        
+                        if is_success {
+                            request.status = RequestStatus::Success;
+                            Ok((request.callback.as_ref().map(|c| c.clone_ref(py)), None, false, request_py_clone))
+                        } else {
+                            request.status = RequestStatus::Failed;
+                            let has_on_failed = request.on_failed.is_some();
+                            Ok((None, request.on_failed.as_ref().map(|f| f.clone_ref(py)), !has_on_failed, request_py_clone))
+                        }
+                    })?
                 };
                 
                 if let Some(callback) = callback_opt {
@@ -1309,9 +1306,10 @@ async fn process_request_async(
                 } else if should_handle_failed {
                     let gateway_name_owned = gateway_name.to_string();
                     let response_text_clone = response_text.clone();
+                    let request_py_clone = Python::attach(|py| request_py.clone_ref(py));
                     tokio::task::spawn_blocking(move || {
                         Python::attach(|py| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-                            handle_failed_response(py, status_code, &request_py, &gateway_name_owned, &response_text_clone)?;
+                            handle_failed_response(py, status_code, &request_py_clone, &gateway_name_owned, &response_text_clone)?;
                             Ok(())
                         })
                     }).await??;
@@ -1330,29 +1328,25 @@ async fn process_request_async(
                 ));
                 
                 if retry_count >= config.max_retries {
-                    
-                    let request_guard = request_arc.write().await;
-                    
-                    let on_error_opt = Python::attach(|py| -> Result<Option<Py<PyAny>>, Box<dyn std::error::Error + Send + Sync>> {
-                        let mut request = request_guard.borrow_mut(py);
-                        request.status = RequestStatus::Error;
-                        Ok(request.on_error.as_ref().map(|e| e.clone_ref(py)))
-                    })?;
-                    
-                    let request_py = {
-                        drop(request_guard);
-                        let read_guard = request_arc.read().await;
-                        Python::attach(|py| read_guard.clone_ref(py))
+                    let (on_error_opt, request_py) = {
+                        let request_guard = request_arc.write().await;
+                        
+                        Python::attach(|py| -> Result<(Option<Py<PyAny>>, Py<Request>), Box<dyn std::error::Error + Send + Sync>> {
+                            let mut request = request_guard.borrow_mut(py);
+                            request.status = RequestStatus::Error;
+                            let on_error = request.on_error.as_ref().map(|e| e.clone_ref(py));
+                            let request_py = request_guard.clone_ref(py);
+                            Ok((on_error, request_py))
+                        })?
                     };
                     
                     let error_msg = e.to_string();
                     if let Some(on_error) = on_error_opt {
-                        let request_py_for_error = Python::attach(|py| request_py.clone_ref(py));
                         PYTHON_EXECUTOR.on_error_async(
                             on_error, 
                             "Exception".to_string(), 
                             error_msg.clone(), 
-                            Some(request_py_for_error)
+                            Some(request_py)
                         ).await;
                     } else {
                         let gateway_name_owned = gateway_name.to_string();
@@ -1370,6 +1364,7 @@ async fn process_request_async(
                 } else {
                     tokio::time::sleep(Duration::from_millis(config.retry_delay_ms)).await;
                     
+                    // 增加重试计数
                     let request_guard = request_arc.read().await;
                     Python::attach(|py| {
                         let request = request_guard.borrow(py);
@@ -1381,28 +1376,24 @@ async fn process_request_async(
                 retry_count += 1;
                 
                 if retry_count >= config.max_retries {
-                    
-                    let request_guard = request_arc.write().await;
-                    
-                    let on_error_opt = Python::attach(|py| -> Result<Option<Py<PyAny>>, Box<dyn std::error::Error + Send + Sync>> {
-                        let mut request = request_guard.borrow_mut(py);
-                        request.status = RequestStatus::Error;
-                        Ok(request.on_error.as_ref().map(|e| e.clone_ref(py)))
-                    })?;
-                    
-                    let request_py = {
-                        drop(request_guard);
-                        let read_guard = request_arc.read().await;
-                        Python::attach(|py| read_guard.clone_ref(py))
+                    let (on_error_opt, request_py) = {
+                        let request_guard = request_arc.write().await;
+                        
+                        Python::attach(|py| -> Result<(Option<Py<PyAny>>, Py<Request>), Box<dyn std::error::Error + Send + Sync>> {
+                            let mut request = request_guard.borrow_mut(py);
+                            request.status = RequestStatus::Error;
+                            let on_error = request.on_error.as_ref().map(|e| e.clone_ref(py));
+                            let request_py = request_guard.clone_ref(py);
+                            Ok((on_error, request_py))
+                        })?
                     };
                     
                     if let Some(on_error) = on_error_opt {
-                        let request_py_for_timeout = Python::attach(|py| request_py.clone_ref(py));
                         PYTHON_EXECUTOR.on_error_async(
                             on_error, 
                             "TimeoutException".to_string(), 
                             "Request timeout".to_string(), 
-                            Some(request_py_for_timeout)
+                            Some(request_py)
                         ).await;
                     } else {
                         let gateway_name_owned = gateway_name.to_string();
@@ -1436,12 +1427,13 @@ async fn execute_request_async_internal(
     request_arc: &Arc<RwLock<Py<Request>>>,
     gateway_name: &str,
     url_base: &str,
-    config: &ClientConfig,
+    _config: &ClientConfig,
 ) -> Result<(u16, String, Value, IndexMap<String, String>), Box<dyn std::error::Error + Send + Sync>> { 
     
+    // 在单独的作用域内提取数据，避免跨 await 持有锁
     let (url, method, headers_data, query_params, body_data, is_jsonrpc) = {
         let request_guard = request_arc.read().await;
-        Python::attach(|py| {
+        let data = Python::attach(|py| {
             let request = request_guard.borrow(py);
             
             let path = request.path.clone();
@@ -1471,7 +1463,6 @@ async fn execute_request_async_internal(
                 vec![]
             };
             
-            // 然后修改 params 提取逻辑 (在 execute_request_async_internal 和 request 方法中都需要修改)
             let query_params: Vec<(String, String)> = if let Some(params_py) = &request.params {
                 let params_obj = params_py.bind(py);
                 if let Ok(params_dict) = params_obj.cast::<PyDict>() {
@@ -1484,16 +1475,13 @@ async fn execute_request_async_internal(
                                 Err(_) => continue,
                             };
                             
-                            // 检查值是否为 list
                             if let Ok(list) = value.cast::<PyList>() {
-                                // 对于 list，为每个元素创建一个同名的键值对
                                 for item in list.iter() {
                                     if let Some(v_str) = pyany_to_param_string(&item) {
                                         params.push((k.clone(), v_str));
                                     }
                                 }
                             } else {
-                                // 非 list 值，直接转换
                                 if let Some(v_str) = pyany_to_param_string(&value) {
                                     params.push((k, v_str));
                                 }
@@ -1510,7 +1498,6 @@ async fn execute_request_async_internal(
                 vec![]
             };
 
-            // FIXED: Track is_jsonrpc based on dict keys, not string content
             let (body_data, is_jsonrpc) = if let Some(data_py) = &request.data {
                 let data_obj = data_py.bind(py);
                 
@@ -1523,7 +1510,6 @@ async fn execute_request_async_internal(
                     }
                 } else if let Ok(data_dict) = data_obj.cast::<PyDict>() {
                     if data_dict.len() > 0 {
-                        // FIXED: Check if "jsonrpc" is a KEY in dict (Python behavior)
                         let is_jsonrpc = data_dict.contains("jsonrpc").unwrap_or(false);
                         match pythondict_to_json_string(data_dict) {
                             Ok(json_str) => (Some(json_str), is_jsonrpc),
@@ -1572,7 +1558,8 @@ async fn execute_request_async_internal(
             };
 
             (url, method, headers_data, query_params, body_data, is_jsonrpc)
-        })
+        });
+        data
     };
 
     execute_request_with_data(client, &method, &url, headers_data, query_params, body_data, is_jsonrpc, gateway_name).await
@@ -1585,7 +1572,7 @@ async fn execute_request_with_data(
     headers_data: Vec<(String, String)>,
     query_params: Vec<(String, String)>,
     body_data: Option<String>,
-    is_jsonrpc: bool,  // NEW parameter
+    is_jsonrpc: bool,
     gateway_name: &str,
 ) -> Result<(u16, String, Value, IndexMap<String, String>), Box<dyn std::error::Error + Send + Sync>> {
     
@@ -1626,10 +1613,8 @@ async fn execute_request_with_data(
         req_builder = req_builder.query(&query_params);
     }
 
-    // FIXED: Handle body data exactly like Python does
     if let Some(data) = body_data {
         if is_jsonrpc {
-            // jsonrpc: use json parameter (like Python's json= parameter)
             match serde_json::from_str::<Value>(&data) {
                 Ok(json_value) => {
                     req_builder = req_builder.json(&json_value);
@@ -1644,7 +1629,6 @@ async fn execute_request_with_data(
                 }
             }
         } else {
-            // non-jsonrpc: use data parameter
             req_builder = req_builder
                 .header("Content-Type", "application/json")
                 .body(data);
@@ -1716,11 +1700,9 @@ fn handle_failed_response(
     gateway_name: &str,
     response_text: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // 处理JSON解码错误
     match serde_json::from_str::<Value>(response_text) {
         Ok(data) => {
             if let Some(msg) = data.get("msg").and_then(|v| v.as_str()) {
-                //过滤OKX请求超时错误和币安重复设置持仓模式错误
                 let filter_msg = vec![
                     "Endpoint request timeout. ",
                     "No need to change position side.",
@@ -1866,7 +1848,6 @@ fn pyany_to_json_value(obj: &Bound<PyAny>) -> PyResult<Value> {
     } else if let Ok(s) = obj.extract::<String>() {
         Ok(Value::String(s))
     } else if let Ok(list) = obj.cast::<PyList>() {
-        // Handle Python lists - convert to JSON arrays
         let mut array = Vec::new();
         for item in list.iter() {
             let v = pyany_to_json_value(&item)?;
