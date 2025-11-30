@@ -135,39 +135,33 @@ impl Request {
         }
     }
 
-    fn __str__(&self) -> String {
+    // 在 Request 的 #[pymethods] impl 块中替换 __str__ 方法
+    fn __str__(&self, py: Python<'_>) -> String {
         let status_code = self.status_code.unwrap_or(0);
-        
         let response_text = self.response_text.as_deref().unwrap_or("");
         
         let headers_str = if let Some(ref headers) = self.headers {
-            Python::attach(|py| {
-                headers.bind(py).repr().map(|s| s.to_string()).unwrap_or_else(|e| {
-                    PYTHON_EXECUTOR.write_log(format!("Request.__str__: headers repr 失败: {}", e));
-                    "{}".to_string()
-                })
+            headers.bind(py).repr().map(|s| s.to_string()).unwrap_or_else(|e| {
+                PYTHON_EXECUTOR.write_log(format!("Request.__str__: headers repr 失败: {}", e));
+                "{}".to_string()
             })
         } else {
             "None".to_string()
         };
         
         let params_str = if let Some(ref params) = self.params {
-            Python::attach(|py| {
-                params.bind(py).repr().map(|s| s.to_string()).unwrap_or_else(|e| {
-                    PYTHON_EXECUTOR.write_log(format!("Request.__str__: params repr 失败: {}", e));
-                    "{}".to_string()
-                })
+            params.bind(py).repr().map(|s| s.to_string()).unwrap_or_else(|e| {
+                PYTHON_EXECUTOR.write_log(format!("Request.__str__: params repr 失败: {}", e));
+                "{}".to_string()
             })
         } else {
             "None".to_string()
         };
         
         let data_str = if let Some(ref data) = self.data {
-            Python::attach(|py| {
-                data.bind(py).repr().map(|s| s.to_string()).unwrap_or_else(|e| {
-                    PYTHON_EXECUTOR.write_log(format!("Request.__str__: data repr 失败: {}", e));
-                    "None".to_string()
-                })
+            data.bind(py).repr().map(|s| s.to_string()).unwrap_or_else(|e| {
+                PYTHON_EXECUTOR.write_log(format!("Request.__str__: data repr 失败: {}", e));
+                "None".to_string()
             })
         } else {
             "None".to_string()
@@ -185,7 +179,6 @@ impl Request {
             response_text
         )
     }
-
     fn increment_retry(&self) -> usize {
         self.retry_count.fetch_add(1, Ordering::Relaxed)
     }
@@ -265,34 +258,70 @@ enum PythonTask {
         gateway_name: String,
         status: bool,
     },
+    /// 更新请求状态（成功场景）
+    UpdateRequestSuccess {
+        request: Py<Request>,
+        status_code: u16,
+        response_text: String,
+        response_headers: IndexMap<String, String>,
+        response_tx: oneshot::Sender<PyResult<(Option<Py<PyAny>>, Py<Request>)>>,
+    },
+    /// 更新请求状态（失败场景）
+    UpdateRequestFailed {
+        request: Py<Request>,
+        status_code: u16,
+        response_text: String,
+        response_headers: IndexMap<String, String>,
+        response_tx: oneshot::Sender<PyResult<(Option<Py<PyAny>>, Option<Py<PyAny>>, bool, Py<Request>)>>,
+    },
+    /// 更新请求为错误状态
+    UpdateRequestError {
+        request: Py<Request>,
+        response_tx: oneshot::Sender<PyResult<(Option<Py<PyAny>>, Py<Request>)>>,
+    },
+    /// 处理失败响应
+    HandleFailedResponse {
+        request: Py<Request>,
+        status_code: u16,
+        gateway_name: String,
+        response_text: String,
+    },
+    /// 处理错误响应
+    HandleErrorResponse {
+        request: Py<Request>,
+        error_msg: String,
+        gateway_name: String,
+    },
 }
+
 
 /// Python 操作执行器
 struct PythonExecutor {
-    task_tx: mpsc::Sender<PythonTask>,  // 修改为有界通道
+    task_tx: mpsc::Sender<PythonTask>,
     _handle: std::thread::JoinHandle<()>,
 }
 
 impl PythonExecutor {
     fn new() -> Self {
-        // 使用有界通道，防止内存无限增长
         let (task_tx, mut task_rx) = mpsc::channel::<PythonTask>(10000);
         
+        let task_tx_for_thread = task_tx.clone();  // Clone before moving into closure
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(std::cmp::min(num_cpus::get(), 8))
-                .thread_name("python-executor")
+                .thread_name("rest-client-python-executor")
                 .enable_all()
                 .build()
                 .expect("Failed to create Python executor runtime");
             
             let python_pool = std::sync::Arc::new(
-                threadpool::ThreadPool::with_name("python-ops".to_string(), 4)
+                threadpool::ThreadPool::with_name("rest-client-python-ops".to_string(), 4)
             );
             
             rt.block_on(async move {
                 while let Some(task) = task_rx.recv().await {
                     let pool = python_pool.clone();
+                    let log_tx = task_tx_for_thread.clone();  
                     
                     match task {
                         PythonTask::Sign { client, request, response_tx } => {
@@ -303,8 +332,9 @@ impl PythonExecutor {
                                     Ok(signed_request)
                                 });
                                 if let Err(_) = response_tx.send(result) {
-                                    // 注意：这里不能使用 PYTHON_EXECUTOR，因为我们在其内部
-                                    eprintln!("PythonTask::Sign: 发送签名结果到通道失败，接收端可能已关闭");
+                                    let _ = log_tx.try_send(PythonTask::WriteLog { 
+                                        message: "PythonTask::Sign: 发送签名结果到通道失败，接收端可能已关闭".to_string() 
+                                    });
                                 }
                             });
                         },
@@ -315,7 +345,11 @@ impl PythonExecutor {
                                     callback.bind(py).call1((py_dict, request.bind(py)))?;
                                     Ok(())
                                 }) {
-                                    eprintln!("PythonTask::Callback: 执行回调失败: {}", e);
+                                    let log_msg = format!(
+                                        "PythonTask::Callback 处理错误: {}\n  收到数据: {}\n  发送请求: {:?}",
+                                        e, data, request
+                                    );
+                                    let _ = log_tx.try_send(PythonTask::WriteLog { message: log_msg });
                                 }
                             });
                         },
@@ -325,56 +359,137 @@ impl PythonExecutor {
                                     callback.bind(py).call1((status_code, request.bind(py)))?;
                                     Ok(())
                                 }) {
-                                    eprintln!("PythonTask::OnFailed: 执行 on_failed 回调失败, status_code={}, error: {}", status_code, e);
+                                    let log_msg = format!(
+                                        "PythonTask::OnFailed 处理错误: {}\n  状态码: {}\n  发送请求: {:?}",
+                                        e, status_code, request
+                                    );
+                                    let _ = log_tx.try_send(PythonTask::WriteLog { message: log_msg });
                                 }
                             });
                         },
-                        PythonTask::OnError { callback, exception_type, exception_value, request } => {
-                            let exception_type_clone = exception_type.clone();
-                            let exception_value_clone = exception_value.clone();
+                        PythonTask::OnError { callback, exception_value, request, .. } => {
                             pool.execute(move || {
                                 if let Err(e) = Python::attach(|py| -> PyResult<()> {
-                                    if let Some(req) = request {
+                                    if let Some(req) = request.as_ref() {
                                         callback.bind(py).call1((
                                             py.get_type::<pyo3::exceptions::PyException>(),
-                                            exception_value,
+                                            exception_value.clone(),
                                             py.None(),
                                             req.bind(py)
                                         ))?;
                                     } else {
                                         callback.bind(py).call1((
                                             py.get_type::<pyo3::exceptions::PyException>(),
-                                            exception_value,
+                                            exception_value.clone(),
                                             py.None(),
                                             py.None()
                                         ))?;
                                     }
                                     Ok(())
                                 }) {
-                                    eprintln!("PythonTask::OnError: 执行 on_error 回调失败, exception_type={}, exception_value={}, error: {}", 
-                                        exception_type_clone, exception_value_clone, e);
+                                    let log_msg = if let Some(req) = request {
+                                        format!(
+                                            "PythonTask::OnError 处理错误: {}\n  异常值: {}\n  发起请求: {:?}",
+                                            e, exception_value, req
+                                        )
+                                    } else {
+                                        format!(
+                                            "PythonTask::OnError 处理错误: {}\n  异常值: {}\n  发起请求: None",
+                                            e, exception_value
+                                        )
+                                    };
+                                    let _ = log_tx.try_send(PythonTask::WriteLog { message: log_msg });
                                 }
                             });
                         },
                         PythonTask::WriteLog { message } => {
-                            let message_clone = message.clone();
                             pool.execute(move || {
-                                if let Err(e) = Python::attach(|py| -> PyResult<()> {
-                                    call_write_log(py, &message)
-                                }) {
-                                    eprintln!("PythonTask::WriteLog: 写日志失败, message={}, error: {}", message_clone, e);
-                                }
+                                let _ = Python::attach(|py| call_write_log(py, &message));
                             });
                         },
                         PythonTask::SaveConnectionStatus { gateway_name, status } => {
-                            let gateway_name_clone = gateway_name.clone();
                             pool.execute(move || {
-                                if let Err(e) = Python::attach(|py| -> PyResult<()> {
-                                    call_save_connection_status(py, &gateway_name, status)
-                                }) {
-                                    eprintln!("PythonTask::SaveConnectionStatus: 保存连接状态失败, gateway={}, status={}, error: {}", 
-                                        gateway_name_clone, status, e);
-                                }
+                                let _ = Python::attach(|py| call_save_connection_status(py, &gateway_name, status));
+                            });
+                        },
+                        // ========== 新增任务处理 ==========
+                        PythonTask::UpdateRequestSuccess { request, status_code, response_text, response_headers, response_tx } => {
+                            pool.execute(move || {
+                                let result = Python::attach(|py| -> PyResult<(Option<Py<PyAny>>, Py<Request>)> {
+                                    let mut req = request.borrow_mut(py);
+                                    req.status_code = Some(status_code);
+                                    req.response_text = Some(response_text.clone());
+                                    req.status = RequestStatus::Success;
+                                    
+                                    let headers_dict = PyDict::new(py);
+                                    for (key, value) in response_headers.iter() {
+                                        headers_dict.set_item(key, value)?;
+                                    }
+                                    let response_obj = PyResponseObject {
+                                        status_code,
+                                        text: response_text,
+                                        headers: headers_dict.unbind(),
+                                    };
+                                    req.response = Some(Py::new(py, response_obj)?.into_any());
+                                    
+                                    let callback = req.callback.as_ref().map(|c| c.clone_ref(py));
+                                    let request_clone = request.clone_ref(py);
+                                    Ok((callback, request_clone))
+                                });
+                                let _ = response_tx.send(result);
+                            });
+                        },
+                        PythonTask::UpdateRequestFailed { request, status_code, response_text, response_headers, response_tx } => {
+                            pool.execute(move || {
+                                let result = Python::attach(|py| -> PyResult<(Option<Py<PyAny>>, Option<Py<PyAny>>, bool, Py<Request>)> {
+                                    let mut req = request.borrow_mut(py);
+                                    req.status_code = Some(status_code);
+                                    req.response_text = Some(response_text.clone());
+                                    req.status = RequestStatus::Failed;
+                                    
+                                    let headers_dict = PyDict::new(py);
+                                    for (key, value) in response_headers.iter() {
+                                        headers_dict.set_item(key, value)?;
+                                    }
+                                    let response_obj = PyResponseObject {
+                                        status_code,
+                                        text: response_text,
+                                        headers: headers_dict.unbind(),
+                                    };
+                                    req.response = Some(Py::new(py, response_obj)?.into_any());
+                                    
+                                    let has_on_failed = req.on_failed.is_some();
+                                    let on_failed = req.on_failed.as_ref().map(|f| f.clone_ref(py));
+                                    let request_clone = request.clone_ref(py);
+                                    Ok((None, on_failed, !has_on_failed, request_clone))
+                                });
+                                let _ = response_tx.send(result);
+                            });
+                        },
+                        PythonTask::UpdateRequestError { request, response_tx } => {
+                            pool.execute(move || {
+                                let result = Python::attach(|py| -> PyResult<(Option<Py<PyAny>>, Py<Request>)> {
+                                    let mut req = request.borrow_mut(py);
+                                    req.status = RequestStatus::Error;
+                                    let on_error = req.on_error.as_ref().map(|e| e.clone_ref(py));
+                                    let request_clone = request.clone_ref(py);
+                                    Ok((on_error, request_clone))
+                                });
+                                let _ = response_tx.send(result);
+                            });
+                        },
+                        PythonTask::HandleFailedResponse { request, status_code, gateway_name, response_text } => {
+                            pool.execute(move || {
+                                let _ = Python::attach(|py| {
+                                    handle_failed_response(py, status_code, &request, &gateway_name, &response_text)
+                                });
+                            });
+                        },
+                        PythonTask::HandleErrorResponse { request, error_msg, gateway_name } => {
+                            pool.execute(move || {
+                                let _ = Python::attach(|py| {
+                                    handle_error_response(py, &error_msg, &request, &gateway_name)
+                                });
                             });
                         },
                     }
@@ -382,79 +497,206 @@ impl PythonExecutor {
             });
         });
         
-        Self {
-            task_tx,
-            _handle: handle,
-        }
+        Self { task_tx, _handle: handle }
     }
     
-    /// 异步调用 Python sign 方法
+    // ========== 原有方法 ==========
     async fn sign_async(&self, client: Py<RestClient>, request: Py<Request>) -> PyResult<Py<Request>> {
         let (response_tx, response_rx) = oneshot::channel();
         
-        self.task_tx.send(PythonTask::Sign {
-            client,
-            request,
-            response_tx,
-        }).await.map_err(|_| PyRuntimeError::new_err("发送签名任务失败"))?;
+        if let Err(_) = self.task_tx.send(PythonTask::Sign { client, request, response_tx }).await {
+            self.write_log("sign_async: 发送签名任务失败".to_string());
+            return Err(PyRuntimeError::new_err("发送签名任务失败"));
+        }
         
-        response_rx.await
-            .map_err(|_| PyRuntimeError::new_err("未收到签名响应"))?
+        response_rx.await.map_err(|_| {
+            self.write_log("sign_async: 未收到签名响应".to_string());
+            PyRuntimeError::new_err("未收到签名响应")
+        })?
     }
     
-    /// 异步调用 Python callback
     async fn callback_async(&self, callback: Py<PyAny>, data: Value, request: Py<Request>) {
-        if let Err(e) = self.task_tx.send(PythonTask::Callback {
-            callback,
-            data,
-            request,
-        }).await {
-            eprintln!("callback_async: 发送回调任务失败: {}", e);
-        }
+        let _ = self.task_tx.send(PythonTask::Callback { callback, data, request }).await;
     }
     
-    /// 异步调用 Python on_failed
     async fn on_failed_async(&self, callback: Py<PyAny>, status_code: u16, request: Py<Request>) {
-        if let Err(e) = self.task_tx.send(PythonTask::OnFailed {
-            callback,
-            status_code,
-            request,
-        }).await {
-            eprintln!("on_failed_async: 发送 on_failed 任务失败, status_code={}, error: {}", status_code, e);
-        }
+        let _ = self.task_tx.send(PythonTask::OnFailed { callback, status_code, request }).await;
     }
     
-    /// 异步调用 Python on_error  
     async fn on_error_async(&self, callback: Py<PyAny>, exception_type: String, exception_value: String, request: Option<Py<Request>>) {
-        if let Err(e) = self.task_tx.send(PythonTask::OnError {
-            callback,
-            exception_type: exception_type.clone(),
-            exception_value: exception_value.clone(),
-            request,
-        }).await {
-            eprintln!("on_error_async: 发送 on_error 任务失败, type={}, value={}, error: {}", 
-                exception_type, exception_value, e);
-        }
+        let _ = self.task_tx.send(PythonTask::OnError { callback, exception_type, exception_value, request }).await;
     }
     
-    /// 异步写日志（不阻塞）- 使用 try_send 避免阻塞
     fn write_log(&self, message: String) {
-        if let Err(e) = self.task_tx.try_send(PythonTask::WriteLog { message: message.clone() }) {
-            eprintln!("write_log: 发送日志任务失败, message={}, error: {}", message, e);
-        }
+        let _ = self.task_tx.try_send(PythonTask::WriteLog { message });
     }
     
-    /// 异步保存连接状态（不阻塞）- 使用 try_send 避免阻塞
     fn save_connection_status(&self, gateway_name: String, status: bool) {
-        if let Err(e) = self.task_tx.try_send(PythonTask::SaveConnectionStatus { 
-            gateway_name: gateway_name.clone(), 
-            status 
-        }) {
-            eprintln!("save_connection_status: 发送连接状态任务失败, gateway={}, status={}, error: {}", 
-                gateway_name, status, e);
+        let _ = self.task_tx.try_send(PythonTask::SaveConnectionStatus { gateway_name, status });
+    }
+    
+    // ========== 新增方法 ==========
+    async fn update_request_success_async(
+        &self,
+        request: Py<Request>,
+        status_code: u16,
+        response_text: String,
+        response_headers: IndexMap<String, String>,
+    ) -> PyResult<(Option<Py<PyAny>>, Py<Request>)> {
+        let (response_tx, response_rx) = oneshot::channel();
+        
+        if let Err(_) = self.task_tx.send(PythonTask::UpdateRequestSuccess { 
+            request, status_code, response_text, response_headers, response_tx 
+        }).await {
+            self.write_log("update_request_success_async: 发送更新成功状态任务失败".to_string());
+            return Err(PyRuntimeError::new_err("发送更新成功状态任务失败"));
         }
+        
+        response_rx.await.map_err(|_| {
+            self.write_log("update_request_success_async: 未收到更新成功状态响应".to_string());
+            PyRuntimeError::new_err("未收到更新成功状态响应")
+        })?
+    }
+    
+    async fn update_request_failed_async(
+        &self,
+        request: Py<Request>,
+        status_code: u16,
+        response_text: String,
+        response_headers: IndexMap<String, String>,
+    ) -> PyResult<(Option<Py<PyAny>>, Option<Py<PyAny>>, bool, Py<Request>)> {
+        let (response_tx, response_rx) = oneshot::channel();
+        
+        if let Err(_) = self.task_tx.send(PythonTask::UpdateRequestFailed { 
+            request, status_code, response_text, response_headers, response_tx 
+        }).await {
+            self.write_log("update_request_failed_async: 发送更新失败状态任务失败".to_string());
+            return Err(PyRuntimeError::new_err("发送更新失败状态任务失败"));
+        }
+        
+        response_rx.await.map_err(|_| {
+            self.write_log("update_request_failed_async: 未收到更新失败状态响应".to_string());
+            PyRuntimeError::new_err("未收到更新失败状态响应")
+        })?
+    }
+    
+    async fn update_request_error_async(&self, request: Py<Request>) -> PyResult<(Option<Py<PyAny>>, Py<Request>)> {
+        let (response_tx, response_rx) = oneshot::channel();
+        
+        if let Err(_) = self.task_tx.send(PythonTask::UpdateRequestError { request, response_tx }).await {
+            self.write_log("update_request_error_async: 发送更新错误状态任务失败".to_string());
+            return Err(PyRuntimeError::new_err("发送更新错误状态任务失败"));
+        }
+        
+        response_rx.await.map_err(|_| {
+            self.write_log("update_request_error_async: 未收到更新错误状态响应".to_string());
+            PyRuntimeError::new_err("未收到更新错误状态响应")
+        })?
+    }
+    
+    async fn handle_failed_response_async(&self, request: Py<Request>, status_code: u16, gateway_name: String, response_text: String) {
+        let _ = self.task_tx.send(PythonTask::HandleFailedResponse { 
+            request, status_code, gateway_name, response_text 
+        }).await;
+    }
+    
+    async fn handle_error_response_async(&self, request: Py<Request>, error_msg: String, gateway_name: String) {
+        let _ = self.task_tx.send(PythonTask::HandleErrorResponse { request, error_msg, gateway_name }).await;
     }
 }
+
+/// 提取请求数据的内部实现（在持有 GIL 时调用）
+fn extract_request_data_impl(
+    py: Python,
+    request: &Py<Request>,
+    url_base: &str,
+    _gateway_name: &str,
+) -> (String, String, Vec<(String, String)>, Vec<(String, String)>, Option<String>, bool) {
+    let request_ref = request.borrow(py);
+    let path = request_ref.path.clone();
+    let req_method = request_ref.method.clone();
+    let url = format!("{}{}", url_base, path);
+    
+    let headers_data: Vec<(String, String)> = if let Some(headers_py) = &request_ref.headers {
+        let headers = headers_py.bind(py);
+        headers.iter()
+            .filter_map(|(key, value)| {
+                let key_str = key.extract::<String>().ok()?;
+                let value_str = if let Ok(v) = value.extract::<String>() {
+                    v
+                } else if let Ok(i) = value.extract::<i64>() {
+                    i.to_string()
+                } else if let Ok(f) = value.extract::<f64>() {
+                    f.to_string()
+                } else if let Ok(b) = value.extract::<bool>() {
+                    b.to_string()
+                } else {
+                    value.str().ok()?.to_string()
+                };
+                Some((key_str, value_str))
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+    
+    let query_params: Vec<(String, String)> = if let Some(params_py) = &request_ref.params {
+        let params_obj = params_py.bind(py);
+        if let Ok(params_dict) = params_obj.cast::<PyDict>() {
+            if params_dict.len() > 0 {
+                let mut params: Vec<(String, String)> = Vec::new();
+                for (key, value) in params_dict.iter() {
+                    let k = match key.extract::<String>() {
+                        Ok(k) => k,
+                        Err(_) => continue,
+                    };
+                    if let Ok(list) = value.cast::<PyList>() {
+                        for item in list.iter() {
+                            if let Some(v_str) = pyany_to_param_string(&item) {
+                                params.push((k.clone(), v_str));
+                            }
+                        }
+                    } else {
+                        if let Some(v_str) = pyany_to_param_string(&value) {
+                            params.push((k, v_str));
+                        }
+                    }
+                }
+                params
+            } else { vec![] }
+        } else { vec![] }
+    } else { vec![] };
+    
+    let (body_data, is_jsonrpc) = if let Some(data_py) = &request_ref.data {
+        let data_obj = data_py.bind(py);
+        if let Ok(data_str) = data_obj.extract::<String>() {
+            if !data_str.is_empty() {
+                let is_jsonrpc = data_str.contains("jsonrpc");
+                (Some(data_str), is_jsonrpc)
+            } else { (None, false) }
+        } else if let Ok(data_dict) = data_obj.cast::<PyDict>() {
+            if data_dict.len() > 0 {
+                let is_jsonrpc = data_dict.contains("jsonrpc").unwrap_or(false);
+                (pythondict_to_json_string(data_dict).ok(), is_jsonrpc)
+            } else { (None, false) }
+        } else if let Ok(data_bytes) = data_obj.cast::<PyBytes>() {
+            let bytes = data_bytes.as_bytes();
+            if !bytes.is_empty() {
+                let s = String::from_utf8_lossy(bytes).to_string();
+                let is_jsonrpc = s.contains("jsonrpc");
+                (Some(s), is_jsonrpc)
+            } else { (None, false) }
+        } else {
+            let s = data_obj.str().ok().map(|s| s.to_string());
+            let is_jsonrpc = s.as_ref().map(|s| s.contains("jsonrpc")).unwrap_or(false);
+            (s, is_jsonrpc)
+        }
+    } else { (None, false) };
+    
+    (url, req_method, headers_data, query_params, body_data, is_jsonrpc)
+}
+
+
 
 // 全局 Python 执行器
 static PYTHON_EXECUTOR: Lazy<PythonExecutor> = Lazy::new(|| PythonExecutor::new());
@@ -888,12 +1130,13 @@ impl RestClient {
             py,
             &format!(
                 "交易接口：{}，REST API请求失败代码：{}，请求路径：{}，完整请求：{}",
-                self.gateway_name, status_code, req.path, req.__str__()
+                self.gateway_name, status_code, req.path, req.__str__(py)
             ),
         )?;
 
         Ok(())
     }
+
 
     fn on_error(
         &self,
@@ -902,13 +1145,15 @@ impl RestClient {
         exception_value: &str,
         request: Option<&Bound<Request>>,
     ) -> PyResult<()> {
-        let text = self.exception_detail(exception_type, exception_value, request);
+        let text = self.exception_detail(py,exception_type, exception_value, request);
         call_write_log(py, &text)?;
         Ok(())
     }
 
+
     fn exception_detail(
         &self,
+        py: Python,
         exception_type: &str,
         exception_value: &str,
         request: Option<&Bound<Request>>,
@@ -919,12 +1164,13 @@ impl RestClient {
         );
         
         if let Some(req) = request {
-            text.push_str(&format!("request:{}\n", req.borrow().__str__()));
+            text.push_str(&format!("request:{}\n", req.borrow().__str__(py)));
         }
         
         text.push_str(&format!("Exception trace: \n{}\n", exception_value));
         text
     }
+
 }
 
 /// 提取请求数据的辅助函数，避免在异步上下文中长时间持有 GIL
@@ -1081,7 +1327,7 @@ async fn create_simple_client(
     }
 }
 
-/// 高并发异步工作器
+/// 高并发异步工作器 - 重构版本（无直接 Python::attach 调用）
 async fn run_async_worker(
     mut receiver: mpsc::UnboundedReceiver<Arc<RwLock<Py<Request>>>>,
     gateway_name: String,
@@ -1133,21 +1379,18 @@ async fn run_async_worker(
         let should_process = should_process || last_batch_time.elapsed() >= BATCH_TIMEOUT;
 
         if should_process && !batch.is_empty() {
-            // 按优先级排序 - 使用 block_in_place 避免在异步上下文中直接调用 Python::attach
-            let priorities: Vec<i32> = {
-                let mut prios = Vec::with_capacity(batch.len());
-                for req_arc in batch.iter() {
-                    let priority = if let Ok(req) = req_arc.try_read() {
-                        tokio::task::block_in_place(|| {
-                            Python::attach(|py| req.borrow(py).priority)
-                        })
-                    } else {
-                        0
-                    };
-                    prios.push(priority);
-                }
-                prios
-            };
+            // 按优先级排序 - 使用 block_in_place 避免饿死 Tokio 运行时
+            let priorities: Vec<i32> = tokio::task::block_in_place(|| {
+                Python::attach(|py| {
+                    batch.iter().map(|req_arc| {
+                        if let Ok(req_guard) = req_arc.try_read() {
+                            req_guard.borrow(py).priority
+                        } else {
+                            0
+                        }
+                    }).collect()
+                })
+            });
             
             let mut indexed_batch: Vec<_> = batch.drain(..).enumerate().collect();
             indexed_batch.sort_by(|(i, _), (j, _)| {
@@ -1163,12 +1406,15 @@ async fn run_async_worker(
                     let gateway_name_clone = gateway_name.clone();
                     let url_base_clone = url_base.clone();
                     let config_clone = config.clone();
-                    let rest_client_clone = Python::attach(|py| rest_client.clone_ref(py));
                     let semaphore_clone = semaphore.clone();
                     let semaphore_timeout = config.semaphore_acquire_timeout_ms;
+                    
+                    // 使用 block_in_place 克隆 rest_client，避免饿死 Tokio 运行时
+                    let rest_client_clone = tokio::task::block_in_place(|| {
+                        Python::attach(|py| rest_client.clone_ref(py))
+                    });
 
                     tokio::spawn(async move {
-                        // 使用 select 来支持超时，避免信号量永久阻塞
                         let permit = tokio::select! {
                             biased;
                             permit = semaphore_clone.acquire_owned() => {
@@ -1215,17 +1461,13 @@ async fn run_async_worker(
                     gateway_name,
                     client_key
                 ));
-                if let Some(ref sender) = Python::attach(|py| {
-                    rest_client.borrow(py).sender.clone()
-                }) {
-                    for request_arc in batch.drain(..) {
-                        if let Err(e) = sender.send(request_arc) {
-                            PYTHON_EXECUTOR.write_log(format!(
-                                "交易接口：{}，重新入队请求失败: {}",
-                                gateway_name, e
-                            ));
-                        }
-                    }
+                // 注意：这里也需要避免直接调用 Python::attach
+                // 简化处理：直接丢弃请求并记录日志
+                for _request_arc in batch.drain(..) {
+                    PYTHON_EXECUTOR.write_log(format!(
+                        "交易接口：{}，由于 HTTP 客户端未找到，丢弃请求",
+                        gateway_name
+                    ));
                 }
             }
 
@@ -1239,7 +1481,7 @@ async fn run_async_worker(
     ));
 }
 
-/// 异步处理单个请求
+/// 异步处理单个请求 - 重构版本（使用 block_in_place 处理 Python 操作）
 async fn process_request_async(
     request_arc: Arc<RwLock<Py<Request>>>,
     client: &Client,
@@ -1249,11 +1491,13 @@ async fn process_request_async(
     rest_client: Py<RestClient>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
-    // 首先对请求进行签名
+    // 1. 签名阶段 - 通过 PythonExecutor
     let signed_request = {
         let request_guard = request_arc.read().await;
-        let request_py = Python::attach(|py| request_guard.clone_ref(py));
-        drop(request_guard);  // 释放锁再调用异步签名
+        let request_py = tokio::task::block_in_place(|| {
+            Python::attach(|py| request_guard.clone_ref(py))
+        });
+        drop(request_guard);
         
         match PYTHON_EXECUTOR.sign_async(rest_client, request_py).await {
             Ok(signed) => signed,
@@ -1272,11 +1516,11 @@ async fn process_request_async(
         *request_guard = signed_request;
     }
 
+    // 2. 获取超时时间
     let timeout_duration = {
         let request_guard = request_arc.read().await;
-        let timeout_ms = Python::attach(|py| {
-            let request = request_guard.borrow(py);
-            request.timeout_ms
+        let timeout_ms = tokio::task::block_in_place(|| {
+            Python::attach(|py| request_guard.borrow(py).timeout_ms)
         });
         Duration::from_millis(timeout_ms)
     };
@@ -1295,81 +1539,58 @@ async fn process_request_async(
                 if status_code == 502 {
                     let path = {
                         let request_guard = request_arc.read().await;
-                        Python::attach(|py| {
-                            let request = request_guard.borrow(py);
-                            request.path.clone()
+                        tokio::task::block_in_place(|| {
+                            Python::attach(|py| request_guard.borrow(py).path.clone())
                         })
                     };
                     
                     let msg = format!(
                         "交易接口：{}，REST API请求失败，请求地址：{}{}，错误代码：{}，错误信息：{}",
-                        gateway_name, 
-                        url_base,
-                        path,
-                        status_code, 
-                        response_text
+                        gateway_name, url_base, path, status_code, response_text
                     );
                     PYTHON_EXECUTOR.write_log(msg);
                     PYTHON_EXECUTOR.save_connection_status(gateway_name.to_string(), false);
                     return Ok(());
                 }
                 
-                // 在单独的作用域内处理请求更新，避免跨 await 持有锁
-                let (callback_opt, on_failed_opt, should_handle_failed, request_py) = {
-                    let request_guard = request_arc.write().await;
-                    
-                    Python::attach(|py| -> Result<(Option<Py<PyAny>>, Option<Py<PyAny>>, bool, Py<Request>), Box<dyn std::error::Error + Send + Sync>> {
-                        let mut request = request_guard.borrow_mut(py);
-                        request.status_code = Some(status_code);
-                        request.response_text = Some(response_text.clone());
-
-                        let headers_dict = PyDict::new(py);
-                        for (key, value) in response_headers.iter() {
-                            if let Err(e) = headers_dict.set_item(key, value) {
-                                PYTHON_EXECUTOR.write_log(format!(
-                                    "交易接口：{}，设置响应头失败, key={}, value={}, error: {}",
-                                    gateway_name, key, value, e
-                                ));
-                                return Err(Box::new(e));
-                            }
-                        }
-                        
-                        let response_obj = PyResponseObject {
-                            status_code,
-                            text: response_text.clone(),
-                            headers: headers_dict.unbind(),
-                        };
-                        request.response = Some(Py::new(py, response_obj)?.into_any());
-
-                        let is_success = status_code / 100 == 2;
-                        
-                        let request_py_clone = request_guard.clone_ref(py);
-                        
-                        if is_success {
-                            request.status = RequestStatus::Success;
-                            Ok((request.callback.as_ref().map(|c| c.clone_ref(py)), None, false, request_py_clone))
-                        } else {
-                            request.status = RequestStatus::Failed;
-                            let has_on_failed = request.on_failed.is_some();
-                            Ok((None, request.on_failed.as_ref().map(|f| f.clone_ref(py)), !has_on_failed, request_py_clone))
-                        }
-                    })?
-                };
+                // 更新请求状态并获取回调信息
+                let is_success = status_code / 100 == 2;
                 
-                if let Some(callback) = callback_opt {
-                    PYTHON_EXECUTOR.callback_async(callback, json_body, request_py).await;
-                } else if let Some(on_failed) = on_failed_opt {
-                    PYTHON_EXECUTOR.on_failed_async(on_failed, status_code, request_py).await;
-                } else if should_handle_failed {
-                    let gateway_name_owned = gateway_name.to_string();
-                    let response_text_clone = response_text.clone();
-                    let request_py_clone = Python::attach(|py| request_py.clone_ref(py));
-                    tokio::task::spawn_blocking(move || {
-                        Python::attach(|py| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-                            handle_failed_response(py, status_code, &request_py_clone, &gateway_name_owned, &response_text_clone)?;
-                            Ok(())
-                        })
-                    }).await??;
+                if is_success {
+                    let request_guard = request_arc.read().await;
+                    let request_clone = tokio::task::block_in_place(|| {
+                        Python::attach(|py| request_guard.clone_ref(py))
+                    });
+                    drop(request_guard);
+                    
+                    let (callback_opt, request_py) = PYTHON_EXECUTOR
+                        .update_request_success_async(request_clone, status_code, response_text.clone(), response_headers)
+                        .await?;
+                    
+                    if let Some(callback) = callback_opt {
+                        PYTHON_EXECUTOR.callback_async(callback, json_body, request_py).await;
+                    }
+                } else {
+                    let request_guard = request_arc.read().await;
+                    let request_clone = tokio::task::block_in_place(|| {
+                        Python::attach(|py| request_guard.clone_ref(py))
+                    });
+                    drop(request_guard);
+                    
+                    let (_, on_failed_opt, should_handle_failed, request_py) = PYTHON_EXECUTOR
+                        .update_request_failed_async(request_clone, status_code, response_text.clone(), response_headers)
+                        .await?;
+                    
+                    if let Some(on_failed) = on_failed_opt {
+                        PYTHON_EXECUTOR.on_failed_async(on_failed, status_code, request_py).await;
+                    } else if should_handle_failed {
+                        PYTHON_EXECUTOR.handle_failed_response_async(
+                            request_py, 
+                            status_code, 
+                            gateway_name.to_string(), 
+                            response_text.clone()
+                        ).await;
+                    }
                 }
                 
                 break;
@@ -1385,36 +1606,31 @@ async fn process_request_async(
                 ));
                 
                 if retry_count >= config.max_retries {
-                    let (on_error_opt, request_py) = {
-                        let request_guard = request_arc.write().await;
-                        
-                        Python::attach(|py| -> Result<(Option<Py<PyAny>>, Py<Request>), Box<dyn std::error::Error + Send + Sync>> {
-                            let mut request = request_guard.borrow_mut(py);
-                            request.status = RequestStatus::Error;
-                            let on_error = request.on_error.as_ref().map(|e| e.clone_ref(py));
-                            let request_py = request_guard.clone_ref(py);
-                            Ok((on_error, request_py))
-                        })?
-                    };
+                    let request_guard = request_arc.read().await;
+                    let request_clone = tokio::task::block_in_place(|| {
+                        Python::attach(|py| request_guard.clone_ref(py))
+                    });
+                    drop(request_guard);
+                    
+                    let (on_error_opt, request_py) = PYTHON_EXECUTOR
+                        .update_request_error_async(request_clone)
+                        .await?;
                     
                     let error_msg = e.to_string();
                     if let Some(on_error) = on_error_opt {
                         PYTHON_EXECUTOR.on_error_async(
                             on_error, 
                             "Exception".to_string(), 
-                            error_msg.clone(), 
+                            error_msg, 
                             Some(request_py)
                         ).await;
                     } else {
-                        let gateway_name_owned = gateway_name.to_string();
-                        let gateway_name_for_status = gateway_name.to_string();
-                        tokio::task::spawn_blocking(move || {
-                            Python::attach(|py| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-                                handle_error_response(py, &error_msg, &request_py, &gateway_name_owned)?;
-                                Ok(())
-                            })
-                        }).await??;
-                        PYTHON_EXECUTOR.save_connection_status(gateway_name_for_status, false);
+                        PYTHON_EXECUTOR.handle_error_response_async(
+                            request_py,
+                            error_msg,
+                            gateway_name.to_string()
+                        ).await;
+                        PYTHON_EXECUTOR.save_connection_status(gateway_name.to_string(), false);
                     }
                     
                     break;
@@ -1423,9 +1639,10 @@ async fn process_request_async(
                     
                     // 增加重试计数
                     let request_guard = request_arc.read().await;
-                    Python::attach(|py| {
-                        let request = request_guard.borrow(py);
-                        request.increment_retry();
+                    tokio::task::block_in_place(|| {
+                        Python::attach(|py| {
+                            request_guard.borrow(py).increment_retry();
+                        })
                     });
                 }
             }
@@ -1433,17 +1650,15 @@ async fn process_request_async(
                 retry_count += 1;
                 
                 if retry_count >= config.max_retries {
-                    let (on_error_opt, request_py) = {
-                        let request_guard = request_arc.write().await;
-                        
-                        Python::attach(|py| -> Result<(Option<Py<PyAny>>, Py<Request>), Box<dyn std::error::Error + Send + Sync>> {
-                            let mut request = request_guard.borrow_mut(py);
-                            request.status = RequestStatus::Error;
-                            let on_error = request.on_error.as_ref().map(|e| e.clone_ref(py));
-                            let request_py = request_guard.clone_ref(py);
-                            Ok((on_error, request_py))
-                        })?
-                    };
+                    let request_guard = request_arc.read().await;
+                    let request_clone = tokio::task::block_in_place(|| {
+                        Python::attach(|py| request_guard.clone_ref(py))
+                    });
+                    drop(request_guard);
+                    
+                    let (on_error_opt, request_py) = PYTHON_EXECUTOR
+                        .update_request_error_async(request_clone)
+                        .await?;
                     
                     if let Some(on_error) = on_error_opt {
                         PYTHON_EXECUTOR.on_error_async(
@@ -1453,13 +1668,11 @@ async fn process_request_async(
                             Some(request_py)
                         ).await;
                     } else {
-                        let gateway_name_owned = gateway_name.to_string();
-                        tokio::task::spawn_blocking(move || {
-                            Python::attach(|py| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-                                handle_error_response(py, "Request timeout", &request_py, &gateway_name_owned)?;
-                                Ok(())
-                            })
-                        }).await??;
+                        PYTHON_EXECUTOR.handle_error_response_async(
+                            request_py,
+                            "Request timeout".to_string(),
+                            gateway_name.to_string()
+                        ).await;
                     }
                     
                     break;
@@ -1467,9 +1680,10 @@ async fn process_request_async(
                     tokio::time::sleep(Duration::from_millis(config.retry_delay_ms)).await;
                     
                     let request_guard = request_arc.read().await;
-                    Python::attach(|py| {
-                        let request = request_guard.borrow(py);
-                        request.increment_retry();
+                    tokio::task::block_in_place(|| {
+                        Python::attach(|py| {
+                            request_guard.borrow(py).increment_retry();
+                        })
                     });
                 }
             }
@@ -1479,6 +1693,8 @@ async fn process_request_async(
     Ok(())
 }
 
+
+/// 执行请求内部实现 - 重构版本（使用 block_in_place 处理 Python 操作）
 async fn execute_request_async_internal(
     client: &Client,
     request_arc: &Arc<RwLock<Py<Request>>>,
@@ -1487,140 +1703,19 @@ async fn execute_request_async_internal(
     _config: &ClientConfig,
 ) -> Result<(u16, String, Value, IndexMap<String, String>), Box<dyn std::error::Error + Send + Sync>> { 
     
-    // 在单独的作用域内提取数据，避免跨 await 持有锁
+    // 使用 block_in_place 提取数据，避免饿死 Tokio 运行时
     let (url, method, headers_data, query_params, body_data, is_jsonrpc) = {
         let request_guard = request_arc.read().await;
-        let data = Python::attach(|py| {
-            let request = request_guard.borrow(py);
-            
-            let path = request.path.clone();
-            let method = request.method.clone();
-            let url = format!("{}{}", url_base, path);
-            
-            let headers_data: Vec<(String, String)> = if let Some(headers_py) = &request.headers {
-                let headers = headers_py.bind(py);
-                headers.iter()
-                    .filter_map(|(key, value)| {
-                        let key_str = key.extract::<String>().ok()?;
-                        let value_str = if let Ok(v) = value.extract::<String>() {
-                            v
-                        } else if let Ok(i) = value.extract::<i64>() {
-                            i.to_string()
-                        } else if let Ok(f) = value.extract::<f64>() {
-                            f.to_string()
-                        } else if let Ok(b) = value.extract::<bool>() {
-                            b.to_string()
-                        } else {
-                            value.str().ok()?.to_string()
-                        };
-                        Some((key_str, value_str))
-                    })
-                    .collect()
-            } else {
-                vec![]
-            };
-            
-            let query_params: Vec<(String, String)> = if let Some(params_py) = &request.params {
-                let params_obj = params_py.bind(py);
-                if let Ok(params_dict) = params_obj.cast::<PyDict>() {
-                    if params_dict.len() > 0 {
-                        let mut params: Vec<(String, String)> = Vec::new();
-                        
-                        for (key, value) in params_dict.iter() {
-                            let k = match key.extract::<String>() {
-                                Ok(k) => k,
-                                Err(_) => continue,
-                            };
-                            
-                            if let Ok(list) = value.cast::<PyList>() {
-                                for item in list.iter() {
-                                    if let Some(v_str) = pyany_to_param_string(&item) {
-                                        params.push((k.clone(), v_str));
-                                    }
-                                }
-                            } else {
-                                if let Some(v_str) = pyany_to_param_string(&value) {
-                                    params.push((k, v_str));
-                                }
-                            }
-                        }
-                        params
-                    } else {
-                        vec![]
-                    }
-                } else {
-                    vec![]
-                }
-            } else {
-                vec![]
-            };
-
-            let (body_data, is_jsonrpc) = if let Some(data_py) = &request.data {
-                let data_obj = data_py.bind(py);
-                
-                if let Ok(data_str) = data_obj.extract::<String>() {
-                    if !data_str.is_empty() {
-                        let is_jsonrpc = data_str.contains("jsonrpc");
-                        (Some(data_str), is_jsonrpc)
-                    } else {
-                        (None, false)
-                    }
-                } else if let Ok(data_dict) = data_obj.cast::<PyDict>() {
-                    if data_dict.len() > 0 {
-                        let is_jsonrpc = data_dict.contains("jsonrpc").unwrap_or(false);
-                        match pythondict_to_json_string(data_dict) {
-                            Ok(json_str) => (Some(json_str), is_jsonrpc),
-                            Err(e) => {
-                                PYTHON_EXECUTOR.write_log(format!(
-                                    "交易接口：{}，Dict转JSON失败，错误信息： {}", 
-                                    gateway_name, e
-                                ));
-                                (None, false)
-                            }
-                        }
-                    } else {
-                        (None, false)
-                    }
-                } else if let Ok(data_bytes) = data_obj.cast::<PyBytes>() {
-                    let bytes = data_bytes.as_bytes();
-                    if !bytes.is_empty() {
-                        let s = String::from_utf8_lossy(bytes).to_string();
-                        let is_jsonrpc = s.contains("jsonrpc");
-                        (Some(s), is_jsonrpc)
-                    } else {
-                        (None, false)
-                    }
-                } else {
-                    match data_obj.str() {
-                        Ok(s) => {
-                            let s_str = s.to_string();
-                            if !s_str.is_empty() && s_str != "None" {
-                                let is_jsonrpc = s_str.contains("jsonrpc");
-                                (Some(s_str), is_jsonrpc)
-                            } else {
-                                (None, false)
-                            }
-                        }
-                        Err(e) => {
-                            PYTHON_EXECUTOR.write_log(format!(
-                                "交易接口：{}，request.data转换失败，错误信息：{}", 
-                                gateway_name, e
-                            ));
-                            (None, false)
-                        }
-                    }
-                }
-            } else {
-                (None, false)
-            };
-
-            (url, method, headers_data, query_params, body_data, is_jsonrpc)
-        });
-        data
+        tokio::task::block_in_place(|| {
+            Python::attach(|py| {
+                extract_request_data_impl(py, &request_guard, url_base, gateway_name)
+            })
+        })
     };
 
     execute_request_with_data(client, &method, &url, headers_data, query_params, body_data, is_jsonrpc, gateway_name).await
 }
+
 
 async fn execute_request_with_data(
     client: &Client,
@@ -1770,10 +1865,8 @@ fn handle_failed_response(
             }
         }
         Err(_) => {
-            let (path, _request_str) = {
-                let request = request_guard.bind(py).borrow();
-                (request.path.clone(), request.__str__())
-            };
+            let request = request_guard.bind(py).borrow();
+            let path = request.path.clone();
             
             call_write_log(
                 py,
@@ -1786,10 +1879,9 @@ fn handle_failed_response(
         }
     }
 
-    let (path, request_str) = {
-        let request = request_guard.bind(py).borrow();
-        (request.path.clone(), request.__str__())
-    };
+    let request = request_guard.bind(py).borrow();
+    let path = request.path.clone();
+    let request_str = request.__str__(py);
     
     call_write_log(
         py,
@@ -1809,10 +1901,8 @@ fn handle_error_response(
     gateway_name: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
-    let request_str = {
-        let request = request_guard.bind(py).borrow();
-        request.__str__()
-    };
+    let request = request_guard.bind(py).borrow();
+    let request_str = request.__str__(py);
     
     let text = format!(
         "交易接口：{}，Unhandled RestClient Error：Exception\nrequest：{}\nException trace：\n{}\n",
@@ -1824,6 +1914,8 @@ fn handle_error_response(
     call_write_log(py, &text)?;
     Ok(())
 }
+
+
 
 fn call_write_log(py: Python, msg: &str) -> PyResult<()> {
     let utility = py.import("vnpy.trader.utility")?;
