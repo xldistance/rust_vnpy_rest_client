@@ -9,19 +9,19 @@ use serde_json::Value;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use indexmap::IndexMap;
-
+use std::mem::ManuallyDrop;
 // 全局连接池和客户端缓存
 static CLIENT_POOL: Lazy<DashMap<String, Arc<Client>>> = Lazy::new(|| DashMap::new());
 // [新增] 全局 Tokio Runtime，避免由 Python GC 触发 Runtime Drop 导致的线程 Join Panic
-static GLOBAL_RUNTIME: Lazy<Arc<tokio::runtime::Runtime>> = Lazy::new(|| {
-    Arc::new(
+static GLOBAL_RUNTIME: Lazy<ManuallyDrop<Arc<tokio::runtime::Runtime>>> = Lazy::new(|| {
+    ManuallyDrop::new(Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(std::cmp::min(num_cpus::get(), 8))
             .thread_name("global-rest-client")
             .enable_all()
             .build()
             .expect("Failed to create global runtime")
-    )
+    ))
 });
 /// 请求状态枚举
 #[pyclass]
@@ -98,7 +98,14 @@ fn pyany_to_param_string(value: &Bound<PyAny>) -> Option<String> {
         value.str().ok().map(|s| s.to_string())
     }
 }
-
+fn pythonlist_to_json_string(list: &Bound<PyList>) -> PyResult<String> {
+    let mut array = Vec::new();
+    for item in list.iter() {
+        let v = pyany_to_json_value(&item)?;
+        array.push(v);
+    }
+    Ok(serde_json::to_string(&Value::Array(array)).unwrap())
+}
 #[pymethods]
 impl Request {
     #[new]
@@ -295,10 +302,11 @@ enum PythonTask {
 }
 
 
-/// Python 操作执行器
+// 修改 PythonExecutor 结构体定义
 struct PythonExecutor {
     task_tx: mpsc::Sender<PythonTask>,
-    _handle: std::thread::JoinHandle<()>,
+    // 使用 ManuallyDrop 避免在程序退出时尝试 join 线程导致的 panic
+    _handle: ManuallyDrop<std::thread::JoinHandle<()>>,
 }
 
 impl PythonExecutor {
@@ -497,7 +505,11 @@ impl PythonExecutor {
             });
         });
         
-        Self { task_tx, _handle: handle }
+        Self { 
+            task_tx, 
+            // 使用 ManuallyDrop 包装 handle，避免静态变量 drop 时尝试 join 线程
+            _handle: ManuallyDrop::new(handle) 
+        }
     }
     
     // ========== 原有方法 ==========
@@ -610,7 +622,7 @@ fn extract_request_data_impl(
     py: Python,
     request: &Py<Request>,
     url_base: &str,
-    _gateway_name: &str,
+    gateway_name: &str,
 ) -> (String, String, Vec<(String, String)>, Vec<(String, String)>, Option<String>, bool) {
     let request_ref = request.borrow(py);
     let path = request_ref.path.clone();
@@ -619,9 +631,20 @@ fn extract_request_data_impl(
     
     let headers_data: Vec<(String, String)> = if let Some(headers_py) = &request_ref.headers {
         let headers = headers_py.bind(py);
-        headers.iter()
+        
+        let result: Vec<(String, String)> = headers.iter()
             .filter_map(|(key, value)| {
-                let key_str = key.extract::<String>().ok()?;
+                let key_str = match key.extract::<String>() {
+                    Ok(k) => k,
+                    Err(e) => {
+                        PYTHON_EXECUTOR.write_log(format!(
+                            "交易接口：{}，提取 header key 失败: {:?}, 错误: {}",
+                            gateway_name, key, e
+                        ));
+                        return None;
+                    }
+                };
+                
                 let value_str = if let Ok(v) = value.extract::<String>() {
                     v
                 } else if let Ok(i) = value.extract::<i64>() {
@@ -631,11 +654,23 @@ fn extract_request_data_impl(
                 } else if let Ok(b) = value.extract::<bool>() {
                     b.to_string()
                 } else {
-                    value.str().ok()?.to_string()
+                    match value.str() {
+                        Ok(s) => s.to_string(),
+                        Err(e) => {
+                            PYTHON_EXECUTOR.write_log(format!(
+                                "交易接口：{}，提取 header value 失败: key='{}', 错误: {}",
+                                gateway_name, key_str, e
+                            ));
+                            return None;
+                        }
+                    }
                 };
+                
                 Some((key_str, value_str))
             })
-            .collect()
+            .collect();
+        
+        result
     } else {
         vec![]
     };
@@ -679,6 +714,13 @@ fn extract_request_data_impl(
                 let is_jsonrpc = data_dict.contains("jsonrpc").unwrap_or(false);
                 (pythondict_to_json_string(data_dict).ok(), is_jsonrpc)
             } else { (None, false) }
+        } else if let Ok(data_list) = data_obj.cast::<PyList>() {
+            // 处理 list 类型的 data（如 JSON-RPC batch request）
+            if data_list.len() > 0 {
+                let json_str = pythonlist_to_json_string(data_list).ok();
+                let is_jsonrpc = json_str.as_ref().map(|s| s.contains("jsonrpc")).unwrap_or(false);
+                (json_str, is_jsonrpc)
+            } else { (None, false) }
         } else if let Ok(data_bytes) = data_obj.cast::<PyBytes>() {
             let bytes = data_bytes.as_bytes();
             if !bytes.is_empty() {
@@ -695,7 +737,6 @@ fn extract_request_data_impl(
     
     (url, req_method, headers_data, query_params, body_data, is_jsonrpc)
 }
-
 
 
 // 全局 Python 执行器
@@ -725,7 +766,7 @@ impl RestClient {
         
         // [修改] 使用全局 Runtime，而不是每次创建一个新的
         // 这避免了当 RestClient 被 Python GC 回收时，Runtime 尝试 shutdown/join 线程导致的 Panic (os error 22)
-        let runtime = GLOBAL_RUNTIME.clone();
+        let runtime = (**GLOBAL_RUNTIME).clone();
 
         let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
         let available = semaphore.available_permits();
@@ -1259,6 +1300,15 @@ fn extract_request_data(
                 } else {
                     (None, false)
                 }
+            } else if let Ok(data_list) = data_obj.cast::<PyList>() {
+                // 处理 list 类型的 data（如 JSON-RPC batch request）
+                if data_list.len() > 0 {
+                    let json_str = pythonlist_to_json_string(data_list).ok();
+                    let is_jsonrpc = json_str.as_ref().map(|s| s.contains("jsonrpc")).unwrap_or(false);
+                    (json_str, is_jsonrpc)
+                } else {
+                    (None, false)
+                }
             } else if let Ok(data_bytes) = data_obj.cast::<PyBytes>() {
                 let bytes = data_bytes.as_bytes();
                 if !bytes.is_empty() {
@@ -1781,9 +1831,8 @@ async fn execute_request_with_data(
                 }
             }
         } else {
-            req_builder = req_builder
-                .header("Content-Type", "application/json")
-                .body(data);
+            req_builder = req_builder.body(data);
+                
         }
     }
 
