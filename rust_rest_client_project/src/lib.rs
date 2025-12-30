@@ -10,6 +10,7 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use indexmap::IndexMap;
 use std::mem::ManuallyDrop;
+use chrono::Local;
 // 全局连接池和客户端缓存
 static CLIENT_POOL: Lazy<DashMap<String, Arc<Client>>> = Lazy::new(|| DashMap::new());
 // [新增] 全局 Tokio Runtime，避免由 Python GC 触发 Runtime Drop 导致的线程 Join Panic
@@ -1002,89 +1003,86 @@ impl RestClient {
         let handle = runtime.handle().clone();
         
         py.detach(move || {
-            // 在新线程中执行异步操作，避免嵌套 runtime
-            std::thread::scope(|_| {
-                handle.block_on(async {
-                    // 签名阶段
-                    let signed_request = tokio::task::spawn_blocking(move || {
-                        Python::attach(|py| -> PyResult<Py<Request>> {
-                            let result = rest_client_py.bind(py).call_method1("sign", (request.bind(py),))?;
-                            Ok(result.extract::<Py<Request>>()?)
-                        })
-                    }).await;
+            handle.block_on(async {
+                // 签名阶段
+                let signed_request = tokio::task::spawn_blocking(move || {
+                    Python::attach(|py| -> PyResult<Py<Request>> {
+                        let result = rest_client_py.bind(py).call_method1("sign", (request.bind(py),))?;
+                        Ok(result.extract::<Py<Request>>()?)
+                    })
+                }).await;
 
-                    let signed_request = match signed_request {
-                        Ok(Ok(s)) => s,
-                        Ok(Err(e)) => return Err(PyRuntimeError::new_err(format!("交易接口：{}，签名失败，错误信息： {}", gateway_name, e))),
-                        Err(e) => return Err(PyRuntimeError::new_err(format!("Signing task failed: {}", e))),
-                    };
+                let signed_request = match signed_request {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => return Err(PyRuntimeError::new_err(format!("交易接口：{}，签名失败，错误信息： {}", gateway_name, e))),
+                    Err(e) => return Err(PyRuntimeError::new_err(format!("Signing task failed: {}", e))),
+                };
 
-                    let client = match CLIENT_POOL.get(&client_key) {
-                        Some(c) => c.clone(),
-                        None => {
-                            let error_msg = "HTTP client not found";
-                            PYTHON_EXECUTOR.write_log(format!(
-                                "交易接口：{}，REST API创建出错，错误信息：{}，重启交易子进程", 
-                                gateway_name, error_msg
-                            ));
-                            PYTHON_EXECUTOR.save_connection_status(gateway_name.clone(), false);
-                            return Err(PyRuntimeError::new_err(error_msg));
+                let client = match CLIENT_POOL.get(&client_key) {
+                    Some(c) => c.clone(),
+                    None => {
+                        let error_msg = "HTTP client not found";
+                        PYTHON_EXECUTOR.write_log(format!(
+                            "交易接口：{}，REST API创建出错，错误信息：{}，重启交易子进程", 
+                            gateway_name, error_msg
+                        ));
+                        PYTHON_EXECUTOR.save_connection_status(gateway_name.clone(), false);
+                        return Err(PyRuntimeError::new_err(error_msg));
+                    }
+                };
+
+                let mut retry_count = 0;
+                loop {
+                    let (url, req_method, headers_data, query_params, body_data, is_jsonrpc) = 
+                        extract_request_data(&signed_request, &url_base, &gateway_name);
+                    
+                    let result = timeout(
+                        Duration::from_millis(config.request_timeout_ms),
+                        execute_request_with_data(&client, &req_method, &url, headers_data, query_params, body_data, is_jsonrpc, &gateway_name)
+                    ).await;
+                    
+                    match result {
+                        Ok(Ok((status_code, response_text, _json_body, response_headers))) => {
+                            return Python::attach(|py| {
+                                let headers_dict = PyDict::new(py);
+                                for (key, value) in response_headers.iter() {
+                                    headers_dict.set_item(key, value)?;
+                                }
+                                Py::new(py, PyResponseObject {
+                                    status_code,
+                                    text: response_text,
+                                    headers: headers_dict.unbind(),
+                                })
+                            });
                         }
-                    };
-
-                    let mut retry_count = 0;
-                    loop {
-                        let (url, req_method, headers_data, query_params, body_data, is_jsonrpc) = 
-                            extract_request_data(&signed_request, &url_base, &gateway_name);
-                        
-                        let result = timeout(
-                            Duration::from_millis(config.request_timeout_ms),
-                            execute_request_with_data(&client, &req_method, &url, headers_data, query_params, body_data, is_jsonrpc, &gateway_name)
-                        ).await;
-                        
-                        match result {
-                            Ok(Ok((status_code, response_text, _json_body, response_headers))) => {
-                                return Python::attach(|py| {
-                                    let headers_dict = PyDict::new(py);
-                                    for (key, value) in response_headers.iter() {
-                                        headers_dict.set_item(key, value)?;
-                                    }
-                                    Py::new(py, PyResponseObject {
-                                        status_code,
-                                        text: response_text,
-                                        headers: headers_dict.unbind(),
-                                    })
-                                });
+                        Ok(Err(e)) => {
+                            retry_count += 1;
+                            if retry_count >= config.max_retries {
+                                let error_msg = format!("经过{}次重试后REST API连接失败，错误信息：{}", config.max_retries, e);
+                                PYTHON_EXECUTOR.write_log(format!(
+                                    "交易接口：{}，REST API连接出错，错误信息：{}，重启交易子进程", 
+                                    gateway_name, error_msg
+                                ));
+                                PYTHON_EXECUTOR.save_connection_status(gateway_name.clone(), false);
+                                return Err(PyRuntimeError::new_err(error_msg));
                             }
-                            Ok(Err(e)) => {
-                                retry_count += 1;
-                                if retry_count >= config.max_retries {
-                                    let error_msg = format!("经过{}次重试后REST API连接失败，错误信息：{}", config.max_retries, e);
-                                    PYTHON_EXECUTOR.write_log(format!(
-                                        "交易接口：{}，REST API连接出错，错误信息：{}，重启交易子进程", 
-                                        gateway_name, error_msg
-                                    ));
-                                    PYTHON_EXECUTOR.save_connection_status(gateway_name.clone(), false);
-                                    return Err(PyRuntimeError::new_err(error_msg));
-                                }
-                                tokio::time::sleep(Duration::from_millis(config.retry_delay_ms)).await;
+                            tokio::time::sleep(Duration::from_millis(config.retry_delay_ms)).await;
+                        }
+                        Err(_) => {
+                            retry_count += 1;
+                            if retry_count >= config.max_retries {
+                                let error_msg = format!("请求超时，重试 {} 次后仍未成功", config.max_retries);
+                                PYTHON_EXECUTOR.write_log(format!(
+                                    "交易接口：{}，REST API连接出错，错误信息：{}，重启交易子进程", 
+                                    gateway_name, error_msg
+                                ));
+                                PYTHON_EXECUTOR.save_connection_status(gateway_name.clone(), false);
+                                return Err(PyRuntimeError::new_err(error_msg));
                             }
-                            Err(_) => {
-                                retry_count += 1;
-                                if retry_count >= config.max_retries {
-                                    let error_msg = format!("请求超时，重试 {} 次后仍未成功", config.max_retries);
-                                    PYTHON_EXECUTOR.write_log(format!(
-                                        "交易接口：{}，REST API连接出错，错误信息：{}，重启交易子进程", 
-                                        gateway_name, error_msg
-                                    ));
-                                    PYTHON_EXECUTOR.save_connection_status(gateway_name.clone(), false);
-                                    return Err(PyRuntimeError::new_err(error_msg));
-                                }
-                                tokio::time::sleep(Duration::from_millis(config.retry_delay_ms)).await;
-                            }
+                            tokio::time::sleep(Duration::from_millis(config.retry_delay_ms)).await;
                         }
                     }
-                })
+                }
             })
         })
     }
@@ -1199,9 +1197,10 @@ impl RestClient {
         exception_value: &str,
         request: Option<&Bound<Request>>,
     ) -> String {
+        let now = Local::now().format("%Y-%m-%dT%H:%M:%S%.3f");
         let mut text = format!(
-            "Unhandled RestClient Error：{}\n",
-            exception_type
+            "[{}]: Unhandled RestClient Error：{}\n",
+            now, exception_type
         );
         
         if let Some(req) = request {
