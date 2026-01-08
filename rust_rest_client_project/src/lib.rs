@@ -2,7 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyBytes, PyList, PyString};
 use pyo3::exceptions::PyRuntimeError;
 use reqwest::Client;
-use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tokio::sync::{mpsc, Semaphore, RwLock, oneshot};
 use tokio::time::{timeout, Duration, Instant};
 use serde_json::Value;
@@ -77,7 +77,6 @@ pub struct Request {
     response_text: Option<String>,
     status_code: Option<u16>,
     start_time: Option<Instant>,
-    retry_count: AtomicUsize,
     
     // 新增用于异步处理的可选字段
     priority: i32,
@@ -137,7 +136,6 @@ impl Request {
             response_text: None,
             status_code: None,
             start_time: None,
-            retry_count: AtomicUsize::new(0),
             priority: 0,
             timeout_ms: 30000,
         }
@@ -187,15 +185,6 @@ impl Request {
             response_text
         )
     }
-    fn increment_retry(&self) -> usize {
-        self.retry_count.fetch_add(1, Ordering::Relaxed)
-    }
-
-    #[getter]
-    fn get_retry_count(&self) -> usize {
-        self.retry_count.load(Ordering::Relaxed)
-    }
-
     #[getter]
     fn get_elapsed_ms(&self) -> u128 {
         if let Some(start) = self.start_time {
@@ -214,8 +203,6 @@ pub struct ClientConfig {
     request_timeout_ms: u64,
     connect_timeout_ms: u64,
     pool_timeout_ms: u64,
-    max_retries: usize,
-    retry_delay_ms: u64,
     batch_size: usize,
     semaphore_acquire_timeout_ms: u64,  // 新增：信号量获取超时
 }
@@ -228,8 +215,6 @@ impl Default for ClientConfig {
             request_timeout_ms: 5000,
             connect_timeout_ms: 5000,
             pool_timeout_ms: 5000,
-            max_retries: 3,
-            retry_delay_ms: 1000,
             batch_size: 50,
             semaphore_acquire_timeout_ms: 30000,  // 30秒超时
         }
@@ -925,7 +910,6 @@ impl RestClient {
                 response_text: None,
                 status_code: None,
                 start_time: Some(Instant::now()),
-                retry_count: AtomicUsize::new(0),
                 priority: 0,
                 timeout_ms: 30000,
             },
@@ -991,7 +975,6 @@ impl RestClient {
                 response_text: None,
                 status_code: None,
                 start_time: Some(Instant::now()),
-                retry_count: AtomicUsize::new(0),
                 priority: 0,
                 timeout_ms: config.request_timeout_ms,
             },
@@ -1031,56 +1014,45 @@ impl RestClient {
                     }
                 };
 
-                let mut retry_count = 0;
-                loop {
-                    let (url, req_method, headers_data, query_params, body_data, is_jsonrpc) = 
-                        extract_request_data(&signed_request, &url_base, &gateway_name);
-                    
-                    let result = timeout(
-                        Duration::from_millis(config.request_timeout_ms),
-                        execute_request_with_data(&client, &req_method, &url, headers_data, query_params, body_data, is_jsonrpc, &gateway_name)
-                    ).await;
-                    
-                    match result {
-                        Ok(Ok((status_code, response_text, _json_body, response_headers))) => {
-                            return Python::attach(|py| {
-                                let headers_dict = PyDict::new(py);
-                                for (key, value) in response_headers.iter() {
-                                    headers_dict.set_item(key, value)?;
-                                }
-                                Py::new(py, PyResponseObject {
-                                    status_code,
-                                    text: response_text,
-                                    headers: headers_dict.unbind(),
-                                })
-                            });
-                        }
-                        Ok(Err(e)) => {
-                            retry_count += 1;
-                            if retry_count >= config.max_retries {
-                                let error_msg = format!("经过{}次重试后REST API连接失败，错误信息：{}", config.max_retries, e);
-                                PYTHON_EXECUTOR.write_log(format!(
-                                    "交易接口：{}，REST API连接出错，错误信息：{}，重启交易子进程", 
-                                    gateway_name, error_msg
-                                ));
-                                PYTHON_EXECUTOR.save_connection_status(gateway_name.clone(), false);
-                                return Err(PyRuntimeError::new_err(error_msg));
+                let (url, req_method, headers_data, query_params, body_data, is_jsonrpc) =
+                    extract_request_data(&signed_request, &url_base, &gateway_name);
+                
+                let result = timeout(
+                    Duration::from_millis(config.request_timeout_ms),
+                    execute_request_with_data(&client, &req_method, &url, headers_data, query_params, body_data, is_jsonrpc, &gateway_name)
+                ).await;
+                
+                match result {
+                    Ok(Ok((status_code, response_text, _json_body, response_headers))) => {
+                        return Python::attach(|py| {
+                            let headers_dict = PyDict::new(py);
+                            for (key, value) in response_headers.iter() {
+                                headers_dict.set_item(key, value)?;
                             }
-                            tokio::time::sleep(Duration::from_millis(config.retry_delay_ms)).await;
-                        }
-                        Err(_) => {
-                            retry_count += 1;
-                            if retry_count >= config.max_retries {
-                                let error_msg = format!("请求超时，重试 {} 次后仍未成功", config.max_retries);
-                                PYTHON_EXECUTOR.write_log(format!(
-                                    "交易接口：{}，REST API连接出错，错误信息：{}，重启交易子进程", 
-                                    gateway_name, error_msg
-                                ));
-                                PYTHON_EXECUTOR.save_connection_status(gateway_name.clone(), false);
-                                return Err(PyRuntimeError::new_err(error_msg));
-                            }
-                            tokio::time::sleep(Duration::from_millis(config.retry_delay_ms)).await;
-                        }
+                            Py::new(py, PyResponseObject {
+                                status_code,
+                                text: response_text,
+                                headers: headers_dict.unbind(),
+                            })
+                        });
+                    }
+                    Ok(Err(e)) => {
+                        let error_msg = format!("REST API连接失败，错误信息：{}", e);
+                        PYTHON_EXECUTOR.write_log(format!(
+                            "交易接口：{}，REST API连接出错，错误信息：{}，重启交易子进程",
+                            gateway_name, error_msg
+                        ));
+                        PYTHON_EXECUTOR.save_connection_status(gateway_name.clone(), false);
+                        return Err(PyRuntimeError::new_err(error_msg));
+                    }
+                    Err(_) => {
+                        let error_msg = "请求超时".to_string();
+                        PYTHON_EXECUTOR.write_log(format!(
+                            "交易接口：{}，REST API连接出错，错误信息：{}，重启交易子进程",
+                            gateway_name, error_msg
+                        ));
+                        PYTHON_EXECUTOR.save_connection_status(gateway_name.clone(), false);
+                        return Err(PyRuntimeError::new_err(error_msg));
                     }
                 }
             })
@@ -1574,167 +1546,131 @@ async fn process_request_async(
         Duration::from_millis(timeout_ms)
     };
 
-    let mut retry_count = 0;
-    loop {
-        let result = timeout(
-            timeout_duration,
-            execute_request_async_internal(client, &request_arc, gateway_name, url_base, config)
-        ).await;
+    let result = timeout(
+        timeout_duration,
+        execute_request_async_internal(client, &request_arc, gateway_name, url_base, config)
+    ).await;
 
-        match result {
-            Ok(Ok((status_code, response_text, json_body, response_headers))) => {
-                
-                // 特殊处理502状态码
-                if status_code == 502 {
-                    let path = {
-                        let request_guard = request_arc.read().await;
-                        tokio::task::block_in_place(|| {
-                            Python::attach(|py| request_guard.borrow(py).path.clone())
-                        })
-                    };
-                    
-                    let msg = format!(
-                        "交易接口：{}，REST API请求失败，请求地址：{}{}，错误代码：{}，错误信息：{}",
-                        gateway_name, url_base, path, status_code, response_text
-                    );
-                    PYTHON_EXECUTOR.write_log(msg);
-                    PYTHON_EXECUTOR.save_connection_status(gateway_name.to_string(), false);
-                    return Ok(());
-                }
-                
-                // 更新请求状态并获取回调信息
-                let is_success = status_code / 100 == 2;
-                
-                if is_success {
-                    let request_guard = request_arc.read().await;
-                    let request_clone = tokio::task::block_in_place(|| {
-                        Python::attach(|py| request_guard.clone_ref(py))
-                    });
-                    drop(request_guard);
-                    
-                    let (callback_opt, request_py) = PYTHON_EXECUTOR
-                        .update_request_success_async(request_clone, status_code, response_text.clone(), response_headers)
-                        .await?;
-                    
-                    if let Some(callback) = callback_opt {
-                        PYTHON_EXECUTOR.callback_async(callback, json_body, request_py).await;
-                    }
-                } else {
-                    let request_guard = request_arc.read().await;
-                    let request_clone = tokio::task::block_in_place(|| {
-                        Python::attach(|py| request_guard.clone_ref(py))
-                    });
-                    drop(request_guard);
-                    
-                    let (_, on_failed_opt, should_handle_failed, request_py) = PYTHON_EXECUTOR
-                        .update_request_failed_async(request_clone, status_code, response_text.clone(), response_headers)
-                        .await?;
-                    
-                    if let Some(on_failed) = on_failed_opt {
-                        PYTHON_EXECUTOR.on_failed_async(on_failed, status_code, request_py).await;
-                    } else if should_handle_failed {
-                        PYTHON_EXECUTOR.handle_failed_response_async(
-                            request_py, 
-                            status_code, 
-                            gateway_name.to_string(), 
-                            response_text.clone()
-                        ).await;
-                    }
-                }
-                
-                break;
-            }
-            Ok(Err(e)) => {
-                retry_count += 1;
-                PYTHON_EXECUTOR.write_log(format!(
-                    "交易接口：{}，请求执行失败 (重试 {}/{})", 
-                    gateway_name, retry_count, config.max_retries
-                ));
-                PYTHON_EXECUTOR.write_log(format!(
-                    "交易接口：{}，错误信息：{}", gateway_name, e
-                ));
-                
-                if retry_count >= config.max_retries {
-                    let request_guard = request_arc.read().await;
-                    let request_clone = tokio::task::block_in_place(|| {
-                        Python::attach(|py| request_guard.clone_ref(py))
-                    });
-                    drop(request_guard);
-                    
-                    let (on_error_opt, request_py) = PYTHON_EXECUTOR
-                        .update_request_error_async(request_clone)
-                        .await?;
-                    
-                    let error_msg = e.to_string();
-                    if let Some(on_error) = on_error_opt {
-                        PYTHON_EXECUTOR.on_error_async(
-                            on_error, 
-                            "Exception".to_string(), 
-                            error_msg, 
-                            Some(request_py)
-                        ).await;
-                    } else {
-                        PYTHON_EXECUTOR.handle_error_response_async(
-                            request_py,
-                            error_msg,
-                            gateway_name.to_string()
-                        ).await;
-                        PYTHON_EXECUTOR.save_connection_status(gateway_name.to_string(), false);
-                    }
-                    
-                    break;
-                } else {
-                    tokio::time::sleep(Duration::from_millis(config.retry_delay_ms)).await;
-                    
-                    // 增加重试计数
+    match result {
+        Ok(Ok((status_code, response_text, json_body, response_headers))) => {
+            
+            // 特殊处理502状态码
+            if status_code == 502 {
+                let path = {
                     let request_guard = request_arc.read().await;
                     tokio::task::block_in_place(|| {
-                        Python::attach(|py| {
-                            request_guard.borrow(py).increment_retry();
-                        })
-                    });
+                        Python::attach(|py| request_guard.borrow(py).path.clone())
+                    })
+                };
+                
+                let msg = format!(
+                    "交易接口：{}，REST API请求失败，请求地址：{}{}，错误代码：{}，错误信息：{}",
+                    gateway_name, url_base, path, status_code, response_text
+                );
+                PYTHON_EXECUTOR.write_log(msg);
+                PYTHON_EXECUTOR.save_connection_status(gateway_name.to_string(), false);
+                return Ok(());
+            }
+            
+            // 更新请求状态并获取回调信息
+            let is_success = status_code / 100 == 2;
+            
+            if is_success {
+                let request_guard = request_arc.read().await;
+                let request_clone = tokio::task::block_in_place(|| {
+                    Python::attach(|py| request_guard.clone_ref(py))
+                });
+                drop(request_guard);
+                
+                let (callback_opt, request_py) = PYTHON_EXECUTOR
+                    .update_request_success_async(request_clone, status_code, response_text.clone(), response_headers)
+                    .await?;
+                
+                if let Some(callback) = callback_opt {
+                    PYTHON_EXECUTOR.callback_async(callback, json_body, request_py).await;
+                }
+            } else {
+                let request_guard = request_arc.read().await;
+                let request_clone = tokio::task::block_in_place(|| {
+                    Python::attach(|py| request_guard.clone_ref(py))
+                });
+                drop(request_guard);
+                
+                let (_, on_failed_opt, should_handle_failed, request_py) = PYTHON_EXECUTOR
+                    .update_request_failed_async(request_clone, status_code, response_text.clone(), response_headers)
+                    .await?;
+                
+                if let Some(on_failed) = on_failed_opt {
+                    PYTHON_EXECUTOR.on_failed_async(on_failed, status_code, request_py).await;
+                } else if should_handle_failed {
+                    PYTHON_EXECUTOR.handle_failed_response_async(
+                        request_py,
+                        status_code,
+                        gateway_name.to_string(),
+                        response_text.clone()
+                    ).await;
                 }
             }
-            Err(_) => {
-                retry_count += 1;
-                
-                if retry_count >= config.max_retries {
-                    let request_guard = request_arc.read().await;
-                    let request_clone = tokio::task::block_in_place(|| {
-                        Python::attach(|py| request_guard.clone_ref(py))
-                    });
-                    drop(request_guard);
-                    
-                    let (on_error_opt, request_py) = PYTHON_EXECUTOR
-                        .update_request_error_async(request_clone)
-                        .await?;
-                    
-                    if let Some(on_error) = on_error_opt {
-                        PYTHON_EXECUTOR.on_error_async(
-                            on_error, 
-                            "TimeoutException".to_string(), 
-                            "Request timeout".to_string(), 
-                            Some(request_py)
-                        ).await;
-                    } else {
-                        PYTHON_EXECUTOR.handle_error_response_async(
-                            request_py,
-                            "Request timeout".to_string(),
-                            gateway_name.to_string()
-                        ).await;
-                    }
-                    
-                    break;
-                } else {
-                    tokio::time::sleep(Duration::from_millis(config.retry_delay_ms)).await;
-                    
-                    let request_guard = request_arc.read().await;
-                    tokio::task::block_in_place(|| {
-                        Python::attach(|py| {
-                            request_guard.borrow(py).increment_retry();
-                        })
-                    });
-                }
+        }
+        Ok(Err(e)) => {
+            PYTHON_EXECUTOR.write_log(format!(
+                "交易接口：{}，请求执行失败", gateway_name
+            ));
+            PYTHON_EXECUTOR.write_log(format!(
+                "交易接口：{}，错误信息：{}", gateway_name, e
+            ));
+            
+            let request_guard = request_arc.read().await;
+            let request_clone = tokio::task::block_in_place(|| {
+                Python::attach(|py| request_guard.clone_ref(py))
+            });
+            drop(request_guard);
+            
+            let (on_error_opt, request_py) = PYTHON_EXECUTOR
+                .update_request_error_async(request_clone)
+                .await?;
+            
+            let error_msg = e.to_string();
+            if let Some(on_error) = on_error_opt {
+                PYTHON_EXECUTOR.on_error_async(
+                    on_error,
+                    "Exception".to_string(),
+                    error_msg,
+                    Some(request_py)
+                ).await;
+            } else {
+                PYTHON_EXECUTOR.handle_error_response_async(
+                    request_py,
+                    error_msg,
+                    gateway_name.to_string()
+                ).await;
+                PYTHON_EXECUTOR.save_connection_status(gateway_name.to_string(), false);
+            }
+        }
+        Err(_) => {
+            let request_guard = request_arc.read().await;
+            let request_clone = tokio::task::block_in_place(|| {
+                Python::attach(|py| request_guard.clone_ref(py))
+            });
+            drop(request_guard);
+            
+            let (on_error_opt, request_py) = PYTHON_EXECUTOR
+                .update_request_error_async(request_clone)
+                .await?;
+            
+            if let Some(on_error) = on_error_opt {
+                PYTHON_EXECUTOR.on_error_async(
+                    on_error,
+                    "TimeoutException".to_string(),
+                    "Request timeout".to_string(),
+                    Some(request_py)
+                ).await;
+            } else {
+                PYTHON_EXECUTOR.handle_error_response_async(
+                    request_py,
+                    "Request timeout".to_string(),
+                    gateway_name.to_string()
+                ).await;
             }
         }
     }
