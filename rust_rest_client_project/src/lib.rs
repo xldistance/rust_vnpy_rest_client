@@ -1,7 +1,20 @@
+//! 面向 vn.py 网关的 Rust/PyO3 REST 客户端实现。
+//!
+//! 该模块通过 [`RestClient`] 向 Python 暴露一个可复用的 HTTP 客户端，
+//! 同时负责连接池复用、异步请求派发、Python 回调调度以及响应对象封装。
+//!
+//! 主要职责包括：
+//!
+//! - 复用全局 [`reqwest::Client`] 连接池，减少重复建连开销；
+//! - 使用全局 Tokio runtime 承载网络 IO 与异步任务；
+//! - 通过 [`PythonExecutor`] 在受控线程池中执行签名、日志与错误回调；
+//! - 将 HTTP 响应统一映射为 [`PyResponseObject`]，便于 Python 侧消费。
+
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyBytes, PyList, PyString};
 use pyo3::exceptions::PyRuntimeError;
 use reqwest::Client;
+use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock, atomic::{AtomicBool, Ordering}};
 use tokio::sync::{mpsc, Semaphore, RwLock, oneshot};
 use tokio::time::{timeout, Duration, Instant};
@@ -12,39 +25,105 @@ use once_cell::sync::Lazy;
 use indexmap::IndexMap;
 use chrono::Local;
 
-// 全局连接池和客户端缓存
+/// 按网关与代理维度缓存的全局 HTTP 客户端池。
 static CLIENT_POOL: Lazy<DashMap<String, Arc<Client>>> = Lazy::new(|| DashMap::new());
 
-// ============================================================
-// 修复1(OnceLock版): 用 OnceLock<Runtime> 替代 Box::leak，
-// 使 Runtime 在进程退出时可被正常 Drop，避免 pthread_join EINVAL。
-// ============================================================
-static GLOBAL_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+/// `process_request_async` 请求执行错误触发连接状态保存的阈值。
+const PROCESS_REQUEST_ERROR_STATUS_THRESHOLD: usize = 5;
 
+/// `process_request_async` 请求执行错误统计窗口。
+const PROCESS_REQUEST_ERROR_STATUS_WINDOW: Duration = Duration::from_secs(60);
+
+/// 按交易接口维度记录 `process_request_async` 请求执行错误时间。
+static PROCESS_REQUEST_ERROR_TIMESTAMPS: Lazy<DashMap<String, VecDeque<Instant>>> = Lazy::new(|| DashMap::new());
+
+/// 记录一次 `process_request_async` 请求执行错误，并判断一分钟内是否达到保存连接状态阈值。
+fn should_save_connection_status_after_process_request_error(gateway_name: &str) -> bool {
+    let now = Instant::now();
+    let mut error_timestamps = PROCESS_REQUEST_ERROR_TIMESTAMPS
+        .entry(gateway_name.to_string())
+        .or_insert_with(VecDeque::new);
+
+    error_timestamps.push_back(now);
+    while let Some(&first_error_time) = error_timestamps.front() {
+        if now.duration_since(first_error_time) > PROCESS_REQUEST_ERROR_STATUS_WINDOW {
+            error_timestamps.pop_front();
+        } else {
+            break;
+        }
+    }
+
+    if error_timestamps.len() >= PROCESS_REQUEST_ERROR_STATUS_THRESHOLD {
+        error_timestamps.clear();
+        true
+    } else {
+        false
+    }
+}
+
+// ============================================================
+// 修复1: 全局 Tokio Runtime 改回“只初始化一次 + 永不析构”。
+//
+// 在 Python 扩展模块（cdylib）里，解释器/动态库退出阶段的析构顺序不可控；
+// Multi-thread Runtime 若在错误的线程/阶段被析构，关闭时内部 join worker
+// 线程可能触发 `failed to join thread: Invalid argument (os error 22)`。
+//
+// 因此这里显式泄漏 Runtime，仅保留 &'static Runtime 句柄，避免在退出阶段对
+// `global-rest-client` 线程池做不安全的 Drop/Join。
+// ============================================================
+static GLOBAL_RUNTIME: OnceLock<&'static tokio::runtime::Runtime> = OnceLock::new();
+
+/// 获取全局唯一的 Tokio runtime。
+///
+/// 该 runtime 采用“只初始化一次且永不析构”的策略，
+/// 以规避 Python 扩展模块卸载阶段可能出现的线程池析构竞态。
 fn get_runtime() -> &'static tokio::runtime::Runtime {
     GLOBAL_RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(std::cmp::min(num_cpus::get(), 8))
-            .max_blocking_threads(32)
-            .thread_name("global-rest-client")
-            .enable_all()
-            .build()
-            .expect("Failed to create global runtime")
+        Box::leak(Box::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(std::cmp::min(num_cpus::get(), 8))
+                .max_blocking_threads(32)
+                .thread_name("global-rest-client")
+                .enable_all()
+                .build()
+                .expect("Failed to create global runtime")
+        ))
     })
 }
 
-/// 请求状态枚举
+/// 构造一个“Python 解释器不可用”的统一异常。
+fn python_unavailable_error(context: &str) -> pyo3::PyErr {
+    PyRuntimeError::new_err(format!("{}: Python interpreter unavailable", context))
+}
+
+/// 在 Python 解释器可用时附着 GIL 并执行闭包。
+///
+/// 若解释器已进入不可附着状态，则返回统一的运行时异常，
+/// 避免在退出阶段因直接访问 Python API 导致未定义行为。
+fn try_attach_py<F, R>(context: &str, f: F) -> PyResult<R>
+where
+    F: for<'py> FnOnce(Python<'py>) -> PyResult<R>,
+{
+    Python::try_attach(f).unwrap_or_else(|| Err(python_unavailable_error(context)))
+}
+
+/// 请求在 Rust 执行管线中的生命周期状态。
 #[pyclass(from_py_object)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RequestStatus {
+    /// 请求已创建但尚未完成签名或发送。
     Ready = 0,
+    /// 请求已成功收到 2xx 响应。
     Success = 1,
+    /// 请求已收到非 2xx 响应，但链路本身可用。
     Failed = 2,
+    /// 请求在签名、发送、超时或回调阶段出现异常。
     Error = 3,
 }
 
 #[pymethods]
 impl RequestStatus {
+    /// 返回小写英文状态名，便于 Python 侧日志和展示。
     #[getter]
     fn name(&self) -> &str {
         match self {
@@ -56,7 +135,10 @@ impl RequestStatus {
     }
 }
 
-/// 高性能请求对象
+/// 单次 REST 请求的完整上下文。
+///
+/// 该类型同时保存请求参数、Python 回调句柄、执行状态以及最近一次响应内容。
+/// 请求对象会在 Python 与 Rust 异步任务之间传递，并在请求完成后被原位更新。
 #[pyclass]
 pub struct Request {
     #[pyo3(get, set)]
@@ -89,6 +171,9 @@ pub struct Request {
     timeout_ms: u64,
 }
 
+/// 将常见 Python 对象转换为查询参数字符串。
+///
+/// 该函数用于兼容 Python 侧传入的字符串、整数、浮点数、布尔值与任意可字符串化对象。
 fn pyany_to_param_string(value: &Bound<PyAny>) -> Option<String> {
     if let Ok(v) = value.extract::<String>() {
         Some(v)
@@ -103,6 +188,7 @@ fn pyany_to_param_string(value: &Bound<PyAny>) -> Option<String> {
     }
 }
 
+/// 将 Python 列表递归序列化为 JSON 字符串。
 fn pythonlist_to_json_string(list: &Bound<PyList>) -> PyResult<String> {
     let mut array = Vec::new();
     for item in list.iter() {
@@ -113,6 +199,7 @@ fn pythonlist_to_json_string(list: &Bound<PyList>) -> PyResult<String> {
 
 #[pymethods]
 impl Request {
+    /// 创建一个待发送的请求对象。
     #[new]
     #[pyo3(signature = (method, path, params=None, data=None, headers=None, callback=None, on_failed=None, on_error=None, extra=None))]
     fn new(
@@ -139,6 +226,7 @@ impl Request {
         }
     }
 
+    /// 返回适合日志记录的请求摘要字符串。
     fn __str__(&self, py: Python<'_>) -> String {
         let status_code = self.status_code.unwrap_or(0);
         let response_text = self.response_text.as_deref().unwrap_or("");
@@ -177,13 +265,14 @@ impl Request {
         )
     }
 
+    /// 返回请求开始计时以来的耗时（毫秒）。
     #[getter]
     fn get_elapsed_ms(&self) -> u128 {
         self.start_time.map(|s| s.elapsed().as_millis()).unwrap_or(0)
     }
 }
 
-/// 配置结构体
+/// REST 客户端内部使用的运行时配置。
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
     max_connections: usize,
@@ -204,12 +293,12 @@ impl Default for ClientConfig {
             connect_timeout_ms: 5000,
             pool_timeout_ms: 5000,
             batch_size: 50,
-            semaphore_acquire_timeout_ms: 30000,
+            semaphore_acquire_timeout_ms: 5000,
         }
     }
 }
 
-/// Python 操作任务
+/// 投递到 Python 执行线程的任务消息。
 enum PythonTask {
     Sign {
         client: Py<RestClient>,
@@ -272,24 +361,28 @@ enum PythonTask {
     Shutdown,
 }
 
+/// Python 操作执行器。
+///
+/// 该组件负责把需要访问 Python 对象的工作转交给专用线程池执行，
+/// 从而将异步 HTTP 逻辑与 GIL/解释器生命周期管理解耦。
 struct PythonExecutor {
     task_tx: mpsc::Sender<PythonTask>,
 }
 
 // ============================================================
-// 修复2(OnceLock版): PythonExecutor 内部 runtime 不再使用 Box::leak，
-// 改为直接在线程闭包内持有所有权，线程退出时自动 Drop。
+// 修复2: PythonExecutor 只是驱动一个接收循环，实际 Python 工作已经交给独立
+// 线程池，因此这里不需要 multi-thread runtime。改成 current-thread runtime，
+// 可以避免额外 worker 线程及其关闭 join 带来的析构风险。
 // ============================================================
 impl PythonExecutor {
+    /// 创建执行器并启动专用接收线程。
     fn new() -> Self {
         let (task_tx, mut task_rx) = mpsc::channel::<PythonTask>(10000);
         let task_tx_for_thread = task_tx.clone();
 
         std::thread::spawn(move || {
-            // ← 修复2: 直接持有 Runtime 所有权，不再 Box::leak
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(std::cmp::min(num_cpus::get(), 8))
-                .max_blocking_threads(16)
+            // ← 修复2: 专用线程内使用 current-thread runtime，生命周期更简单
+            let rt = tokio::runtime::Builder::new_current_thread()
                 .thread_name("rest-client-python-executor")
                 .enable_all()
                 .build()
@@ -310,7 +403,7 @@ impl PythonExecutor {
 
                         PythonTask::Sign { client, request, response_tx } => {
                             pool.execute(move || {
-                                let result = Python::attach(|py| -> PyResult<Py<Request>> {
+                                let result = try_attach_py("PythonTask::Sign", |py| -> PyResult<Py<Request>> {
                                     let result = client.bind(py).call_method1("sign", (request.bind(py),))?;
                                     Ok(result.extract::<Py<Request>>()?)
                                 });
@@ -324,37 +417,56 @@ impl PythonExecutor {
 
                         PythonTask::Callback { callback, data, request } => {
                             pool.execute(move || {
-                                if let Err(e) = Python::attach(|py| -> PyResult<()> {
+                                match Python::try_attach(|py| -> PyResult<()> {
                                     let py_dict = json_to_pyobject(py, &data)?;
                                     callback.bind(py).call1((py_dict, request.bind(py)))?;
                                     Ok(())
                                 }) {
-                                    let _ = log_tx.try_send(PythonTask::WriteLog {
-                                        message: format!("PythonTask::Callback 处理错误: {}", e)
-                                    });
+                                    Some(Ok(())) => {}
+                                    Some(Err(e)) => {
+                                        let _ = log_tx.try_send(PythonTask::WriteLog {
+                                            message: format!("PythonTask::Callback 处理错误: {}", e)
+                                        });
+                                    }
+                                    None => {
+                                        let _ = log_tx.try_send(PythonTask::WriteLog {
+                                            message: "PythonTask::Callback: Python interpreter unavailable".to_string()
+                                        });
+                                    }
                                 }
                             });
                         },
 
                         PythonTask::OnFailed { callback, status_code, request } => {
                             pool.execute(move || {
-                                if let Err(e) = Python::attach(|py| -> PyResult<()> {
+                                match Python::try_attach(|py| -> PyResult<()> {
                                     callback.bind(py).call1((status_code, request.bind(py)))?;
                                     Ok(())
                                 }) {
-                                    let _ = log_tx.try_send(PythonTask::WriteLog {
-                                        message: format!(
-                                            "PythonTask::OnFailed 处理错误: {}, 状态码: {}",
-                                            e, status_code
-                                        )
-                                    });
+                                    Some(Ok(())) => {}
+                                    Some(Err(e)) => {
+                                        let _ = log_tx.try_send(PythonTask::WriteLog {
+                                            message: format!(
+                                                "PythonTask::OnFailed 处理错误: {}, 状态码: {}",
+                                                e, status_code
+                                            )
+                                        });
+                                    }
+                                    None => {
+                                        let _ = log_tx.try_send(PythonTask::WriteLog {
+                                            message: format!(
+                                                "PythonTask::OnFailed: Python interpreter unavailable, 状态码: {}",
+                                                status_code
+                                            )
+                                        });
+                                    }
                                 }
                             });
                         },
 
                         PythonTask::OnError { callback, exception_type, exception_value, request } => {
                             pool.execute(move || {
-                                if let Err(e) = Python::attach(|py| -> PyResult<()> {
+                                match Python::try_attach(|py| -> PyResult<()> {
                                     let exc_type = py.get_type::<pyo3::exceptions::PyException>();
                                     if let Some(req) = request.as_ref() {
                                         callback.bind(py).call1((
@@ -373,31 +485,42 @@ impl PythonExecutor {
                                     }
                                     Ok(())
                                 }) {
-                                    let _ = log_tx.try_send(PythonTask::WriteLog {
-                                        message: format!(
-                                            "PythonTask::OnError 处理错误: {}, 异常类型: {}, 异常值: {}",
-                                            e, exception_type, exception_value
-                                        )
-                                    });
+                                    Some(Ok(())) => {}
+                                    Some(Err(e)) => {
+                                        let _ = log_tx.try_send(PythonTask::WriteLog {
+                                            message: format!(
+                                                "PythonTask::OnError 处理错误: {}, 异常类型: {}, 异常值: {}",
+                                                e, exception_type, exception_value
+                                            )
+                                        });
+                                    }
+                                    None => {
+                                        let _ = log_tx.try_send(PythonTask::WriteLog {
+                                            message: format!(
+                                                "PythonTask::OnError: Python interpreter unavailable, 异常类型: {}, 异常值: {}",
+                                                exception_type, exception_value
+                                            )
+                                        });
+                                    }
                                 }
                             });
                         },
 
                         PythonTask::WriteLog { message } => {
                             pool.execute(move || {
-                                let _ = Python::attach(|py| call_write_log(py, &message));
+                                let _ = Python::try_attach(|py| call_write_log(py, &message));
                             });
                         },
 
                         PythonTask::SaveConnectionStatus { gateway_name, status } => {
                             pool.execute(move || {
-                                let _ = Python::attach(|py| call_save_connection_status(py, &gateway_name, status));
+                                let _ = Python::try_attach(|py| call_save_connection_status(py, &gateway_name, status));
                             });
                         },
 
                         PythonTask::UpdateRequestSuccess { request, status_code, response_text, response_headers, response_tx } => {
                             pool.execute(move || {
-                                let result = Python::attach(|py| -> PyResult<(Option<Py<PyAny>>, Py<Request>)> {
+                                let result = try_attach_py("PythonTask::UpdateRequestSuccess", |py| -> PyResult<(Option<Py<PyAny>>, Py<Request>)> {
                                     let mut req = request.borrow_mut(py);
                                     req.status_code = Some(status_code);
                                     req.response_text = Some(response_text.clone());
@@ -423,7 +546,7 @@ impl PythonExecutor {
 
                         PythonTask::UpdateRequestFailed { request, status_code, response_text, response_headers, response_tx } => {
                             pool.execute(move || {
-                                let result = Python::attach(|py| -> PyResult<(Option<Py<PyAny>>, bool, Py<Request>)> {
+                                let result = try_attach_py("PythonTask::UpdateRequestFailed", |py| -> PyResult<(Option<Py<PyAny>>, bool, Py<Request>)> {
                                     let mut req = request.borrow_mut(py);
                                     req.status_code = Some(status_code);
                                     req.response_text = Some(response_text.clone());
@@ -450,7 +573,7 @@ impl PythonExecutor {
 
                         PythonTask::UpdateRequestError { request, response_tx } => {
                             pool.execute(move || {
-                                let result = Python::attach(|py| -> PyResult<(Option<Py<PyAny>>, Py<Request>)> {
+                                let result = try_attach_py("PythonTask::UpdateRequestError", |py| -> PyResult<(Option<Py<PyAny>>, Py<Request>)> {
                                     let mut req = request.borrow_mut(py);
                                     req.status = RequestStatus::Error;
                                     let on_error = req.on_error.as_ref().map(|e| e.clone_ref(py));
@@ -463,7 +586,7 @@ impl PythonExecutor {
 
                         PythonTask::HandleFailedResponse { request, status_code, gateway_name, response_text } => {
                             pool.execute(move || {
-                                let _ = Python::attach(|py| {
+                                let _ = Python::try_attach(|py| {
                                     handle_failed_response(py, status_code, &request, &gateway_name, &response_text)
                                 });
                             });
@@ -471,7 +594,7 @@ impl PythonExecutor {
 
                         PythonTask::HandleErrorResponse { request, error_msg, gateway_name } => {
                             pool.execute(move || {
-                                let _ = Python::attach(|py| {
+                                let _ = Python::try_attach(|py| {
                                     handle_error_response(py, &error_msg, &request, &gateway_name)
                                 });
                             });
@@ -485,10 +608,12 @@ impl PythonExecutor {
         Self { task_tx }
     }
 
+    /// 发送关闭信号，通知接收循环优雅退出。
     fn shutdown(&self) {
         let _ = self.task_tx.try_send(PythonTask::Shutdown);
     }
 
+    /// 异步调用 Python 侧的 `sign` 方法并返回签名后的请求对象。
     async fn sign_async(&self, client: Py<RestClient>, request: Py<Request>) -> PyResult<Py<Request>> {
         let (response_tx, response_rx) = oneshot::channel();
         if self.task_tx.send(PythonTask::Sign { client, request, response_tx }).await.is_err() {
@@ -501,26 +626,32 @@ impl PythonExecutor {
         })?
     }
 
+    /// 异步触发成功回调。
     async fn callback_async(&self, callback: Py<PyAny>, data: Value, request: Py<Request>) {
         let _ = self.task_tx.send(PythonTask::Callback { callback, data, request }).await;
     }
 
+    /// 异步触发失败回调。
     async fn on_failed_async(&self, callback: Py<PyAny>, status_code: u16, request: Py<Request>) {
         let _ = self.task_tx.send(PythonTask::OnFailed { callback, status_code, request }).await;
     }
 
+    /// 异步触发异常回调。
     async fn on_error_async(&self, callback: Py<PyAny>, exception_type: String, exception_value: String, request: Option<Py<Request>>) {
         let _ = self.task_tx.send(PythonTask::OnError { callback, exception_type, exception_value, request }).await;
     }
 
+    /// 尽力将日志消息转发到 Python 侧日志函数。
     fn write_log(&self, message: String) {
         let _ = self.task_tx.try_send(PythonTask::WriteLog { message });
     }
 
+    /// 将连接状态保存到 Python 侧持久化逻辑。
     fn save_connection_status(&self, gateway_name: String, status: bool) {
         let _ = self.task_tx.try_send(PythonTask::SaveConnectionStatus { gateway_name, status });
     }
 
+    /// 在 Python 持有的请求对象上写入成功响应信息。
     async fn update_request_success_async(
         &self,
         request: Py<Request>,
@@ -537,6 +668,7 @@ impl PythonExecutor {
         response_rx.await.map_err(|_| PyRuntimeError::new_err("未收到更新成功状态响应"))?
     }
 
+    /// 在 Python 持有的请求对象上写入失败响应信息。
     async fn update_request_failed_async(
         &self,
         request: Py<Request>,
@@ -553,6 +685,7 @@ impl PythonExecutor {
         response_rx.await.map_err(|_| PyRuntimeError::new_err("未收到更新失败状态响应"))?
     }
 
+    /// 将请求状态更新为异常。
     async fn update_request_error_async(&self, request: Py<Request>) -> PyResult<(Option<Py<PyAny>>, Py<Request>)> {
         let (response_tx, response_rx) = oneshot::channel();
         if self.task_tx.send(PythonTask::UpdateRequestError { request, response_tx }).await.is_err() {
@@ -561,12 +694,14 @@ impl PythonExecutor {
         response_rx.await.map_err(|_| PyRuntimeError::new_err("未收到更新错误状态响应"))?
     }
 
+    /// 调用默认失败处理逻辑。
     async fn handle_failed_response_async(&self, request: Py<Request>, status_code: u16, gateway_name: String, response_text: String) {
         let _ = self.task_tx.send(PythonTask::HandleFailedResponse {
             request, status_code, gateway_name, response_text
         }).await;
     }
 
+    /// 调用默认异常处理逻辑。
     async fn handle_error_response_async(&self, request: Py<Request>, error_msg: String, gateway_name: String) {
         let _ = self.task_tx.send(PythonTask::HandleErrorResponse { request, error_msg, gateway_name }).await;
     }
@@ -579,7 +714,9 @@ impl Drop for PythonExecutor {
     }
 }
 
-/// 统一的请求数据提取函数
+/// 在持有 GIL 的前提下，将请求对象拆解为底层 HTTP 调用所需的数据。
+///
+/// 返回值依次为：完整 URL、HTTP 方法、请求头、查询参数、请求体、是否为 JSON-RPC 请求。
 fn extract_request_data_with_gil(
     py: Python,
     request: &Py<Request>,
@@ -686,19 +823,24 @@ fn extract_request_data_with_gil(
     (url, req_method, headers_data, query_params, body_data, is_jsonrpc)
 }
 
-/// 在异步上下文中提取请求数据
+/// 在异步上下文中安全提取请求数据。
 fn extract_request_data(
     signed_request: &Py<Request>,
     url_base: &str,
     gateway_name: &str,
-) -> (String, String, Vec<(String, String)>, Vec<(String, String)>, Option<String>, bool) {
-    Python::attach(|py| extract_request_data_with_gil(py, signed_request, url_base, gateway_name))
+) -> PyResult<(String, String, Vec<(String, String)>, Vec<(String, String)>, Option<String>, bool)> {
+    try_attach_py("extract_request_data", |py| {
+        Ok(extract_request_data_with_gil(py, signed_request, url_base, gateway_name))
+    })
 }
 
-// 全局 Python 执行器
+/// 全局 Python 执行器实例。
 static PYTHON_EXECUTOR: Lazy<PythonExecutor> = Lazy::new(|| PythonExecutor::new());
 
-/// 高性能REST客户端
+/// 暴露给 Python 的高性能 REST 客户端。
+///
+/// 该类型负责初始化共享 HTTP 客户端、启动异步 worker、
+/// 派发同步/异步请求，并在失败、异常与超时场景下调用 Python 侧钩子。
 #[pyclass(subclass)]
 pub struct RestClient {
     url_base: String,
@@ -716,6 +858,7 @@ pub struct RestClient {
 
 #[pymethods]
 impl RestClient {
+    /// 创建一个尚未初始化的客户端实例。
     #[new]
     #[pyo3(signature = (*_args, **_kwargs))]
     fn new(_args: &Bound<pyo3::types::PyTuple>, _kwargs: Option<&Bound<PyDict>>) -> PyResult<Self> {
@@ -741,6 +884,7 @@ impl RestClient {
         })
     }
 
+    /// 初始化客户端基础配置并创建共享 HTTP 客户端。
     #[pyo3(signature = (url_base, proxy_host="", proxy_port=0, gateway_name=""))]
     fn init(
         &mut self,
@@ -786,6 +930,7 @@ impl RestClient {
         Ok(())
     }
 
+    /// 启动异步 worker，开始消费请求队列。
     fn start(slf: &Bound<'_, Self>) -> PyResult<()> {
         let mut self_mut = slf.borrow_mut();
         let gateway_name = self_mut.gateway_name.clone();
@@ -822,16 +967,19 @@ impl RestClient {
         Ok(())
     }
 
+    /// 停止客户端并关闭新的请求投递。
     fn stop(&mut self) -> PyResult<()> {
         self.active.store(false, Ordering::SeqCst);
         self.sender = None;
         Ok(())
     }
 
+    /// 与 Python 侧旧接口保持兼容的空实现。
     fn join(&mut self) -> PyResult<()> {
         Ok(())
     }
 
+    /// 构造请求对象并投递到异步 worker 队列。
     #[pyo3(signature = (method, path, callback, params=None, data=None, headers=None, on_failed=None, on_error=None, extra=None))]
     fn add_request(
         slf: &Bound<'_, Self>,
@@ -869,10 +1017,16 @@ impl RestClient {
         Ok(request)
     }
 
+    /// 默认签名实现：直接返回原请求。
+    ///
+    /// Python 子类可以覆写该方法，为请求补充鉴权头或签名参数。
     fn sign<'py>(&self, request: Bound<'py, Request>) -> PyResult<Bound<'py, Request>> {
         Ok(request)
     }
 
+    /// 以同步接口的形式执行单次请求。
+    ///
+    /// 实际网络操作仍在 Tokio runtime 中完成，当前方法负责等待结果并将其转换为 Python 对象。
     #[pyo3(signature = (method, path, params=None, data=None, headers=None))]
     fn request(
         slf: &Bound<'_, Self>,
@@ -941,7 +1095,7 @@ impl RestClient {
                 };
 
                 let (url, req_method, headers_data, query_params, body_data, is_jsonrpc) =
-                    extract_request_data(&signed_request, &url_base, &gateway_name);
+                    extract_request_data(&signed_request, &url_base, &gateway_name)?;
 
                 let result = timeout(
                     Duration::from_millis(config.request_timeout_ms),
@@ -950,7 +1104,7 @@ impl RestClient {
 
                 match result {
                     Ok(Ok((status_code, response_text, _json_body, response_headers))) => {
-                        Python::attach(|py| {
+                        try_attach_py("RestClient::request", |py| {
                             let headers_dict = PyDict::new(py);
                             for (k, v) in response_headers.iter() {
                                 headers_dict.set_item(k, v)?;
@@ -974,10 +1128,12 @@ impl RestClient {
         })
     }
 
+    /// 返回当前运行配置的调试字符串。
     fn get_config(&self) -> String {
         format!("{:?}", self.config)
     }
 
+    /// 动态更新部分运行配置。
     #[pyo3(signature = (max_concurrent_requests=None, request_timeout_ms=None))]
     fn update_config(
         &mut self,
@@ -1005,10 +1161,12 @@ impl RestClient {
     #[getter]
     fn get_active(&self) -> bool { self.active.load(Ordering::SeqCst) }
 
+    /// 基于当前 `url_base` 拼接完整请求地址。
     fn make_full_url(&self, path: &str) -> String {
         format!("{}{}", self.url_base, path)
     }
 
+    /// 执行默认的失败响应日志处理逻辑。
     fn on_failed(&self, py: Python, status_code: u16, request: &Bound<Request>) -> PyResult<()> {
         let req = request.borrow();
         if let Some(response_text) = &req.response_text {
@@ -1037,6 +1195,7 @@ impl RestClient {
         Ok(())
     }
 
+    /// 执行默认的异常日志处理逻辑。
     fn on_error(
         &self, py: Python,
         exception_type: &str, exception_value: &str,
@@ -1047,6 +1206,7 @@ impl RestClient {
         Ok(())
     }
 
+    /// 生成包含时间戳、请求信息和异常详情的错误文本。
     fn exception_detail(
         &self, py: Python,
         exception_type: &str, exception_value: &str,
@@ -1062,6 +1222,7 @@ impl RestClient {
     }
 }
 
+/// 构建一个启用连接池与可选代理的 `reqwest::Client`。
 async fn create_simple_client(
     proxy: Option<String>,
     config: &ClientConfig,
@@ -1091,6 +1252,7 @@ async fn create_simple_client(
     })
 }
 
+/// 消费请求队列、批量排序并派发异步 HTTP 任务。
 async fn run_async_worker(
     mut receiver: mpsc::UnboundedReceiver<Arc<RwLock<Py<Request>>>>,
     gateway_name: String,
@@ -1131,11 +1293,12 @@ async fn run_async_worker(
 
         if (should_process || last_batch_time.elapsed() >= BATCH_TIMEOUT) && !batch.is_empty() {
             let priorities: Vec<i32> = tokio::task::block_in_place(|| {
-                Python::attach(|py| {
+                Python::try_attach(|py| {
                     batch.iter().map(|req_arc| {
                         req_arc.try_read().map(|g| g.borrow(py).priority).unwrap_or(0)
                     }).collect()
                 })
+                .unwrap_or_else(|| vec![0; batch.len()])
             });
 
             let mut indexed: Vec<(i32, Arc<RwLock<Py<Request>>>)> = priorities
@@ -1163,16 +1326,32 @@ async fn run_async_worker(
                     let cfg = config.clone();
                     let sem = semaphore.clone();
 
-                    let rc_clone = tokio::task::block_in_place(|| {
-                        Python::attach(|py| rest_client.clone_ref(py))
-                    });
+                    let Some(rc_clone) = tokio::task::block_in_place(|| {
+                        Python::try_attach(|py| rest_client.clone_ref(py))
+                    }) else {
+                        PYTHON_EXECUTOR.write_log(format!(
+                            "交易接口：{}，Python解释器不可用，跳过请求派发",
+                            gw
+                        ));
+                        continue;
+                    };
 
                     task_set.spawn(async move {
-                        let permit = match sem.acquire_owned().await {
-                            Ok(p) => p,
-                            Err(e) => {
+                        let permit = match timeout(
+                            Duration::from_millis(cfg.semaphore_acquire_timeout_ms),
+                            sem.acquire_owned(),
+                        ).await {
+                            Ok(Ok(p)) => p,
+                            Ok(Err(e)) => {
                                 PYTHON_EXECUTOR.write_log(format!(
                                     "交易接口：{}，信号量已关闭，丢弃请求: {}", gw, e
+                                ));
+                                return;
+                            }
+                            Err(_) => {
+                                PYTHON_EXECUTOR.write_log(format!(
+                                    "交易接口：{}，获取信号量超时，丢弃请求，等待超时: {}ms",
+                                    gw, cfg.semaphore_acquire_timeout_ms
                                 ));
                                 return;
                             }
@@ -1212,6 +1391,9 @@ async fn run_async_worker(
     PYTHON_EXECUTOR.write_log(format!("交易接口：{}，异步worker已退出", gateway_name));
 }
 
+/// 执行单个异步请求的完整生命周期。
+///
+/// 该流程包括签名、提取参数、发送 HTTP 请求、更新请求状态以及触发对应回调。
 async fn process_request_async(
     request_arc: Arc<RwLock<Py<Request>>>,
     client: &Client,
@@ -1225,8 +1407,9 @@ async fn process_request_async(
     let signed_request = {
         let request_guard = request_arc.read().await;
         let request_py = tokio::task::block_in_place(|| {
-            Python::attach(|py| request_guard.clone_ref(py))
-        });
+            Python::try_attach(|py| request_guard.clone_ref(py))
+        })
+        .ok_or_else(|| std::io::Error::other("Python interpreter unavailable while cloning request for signing"))?;
         drop(request_guard);
 
         match PYTHON_EXECUTOR.sign_async(rest_client, request_py).await {
@@ -1248,7 +1431,10 @@ async fn process_request_async(
     // 2. 获取超时
     let timeout_duration = {
         let guard = request_arc.read().await;
-        let ms = tokio::task::block_in_place(|| Python::attach(|py| guard.borrow(py).timeout_ms));
+        let ms = tokio::task::block_in_place(|| {
+            Python::try_attach(|py| guard.borrow(py).timeout_ms)
+        })
+        .unwrap_or(config.request_timeout_ms);
         Duration::from_millis(ms)
     };
 
@@ -1262,7 +1448,10 @@ async fn process_request_async(
             if status_code == 502 {
                 let path = {
                     let guard = request_arc.read().await;
-                    tokio::task::block_in_place(|| Python::attach(|py| guard.borrow(py).path.clone()))
+                    tokio::task::block_in_place(|| {
+                        Python::try_attach(|py| guard.borrow(py).path.clone())
+                    })
+                    .unwrap_or_else(|| "<python unavailable>".to_string())
                 };
                 PYTHON_EXECUTOR.write_log(format!(
                     "交易接口：{}，REST API请求失败，请求地址：{}{}，错误代码：{}，错误信息：{}",
@@ -1274,7 +1463,10 @@ async fn process_request_async(
 
             let request_clone = {
                 let guard = request_arc.read().await;
-                tokio::task::block_in_place(|| Python::attach(|py| guard.clone_ref(py)))
+                tokio::task::block_in_place(|| {
+                    Python::try_attach(|py| guard.clone_ref(py))
+                })
+                .ok_or_else(|| std::io::Error::other("Python interpreter unavailable while cloning request after success"))?
             };
 
             if status_code / 100 == 2 {
@@ -1301,7 +1493,10 @@ async fn process_request_async(
             PYTHON_EXECUTOR.write_log(format!("交易接口：{}，请求执行失败：{}", gateway_name, e));
             let request_clone = {
                 let guard = request_arc.read().await;
-                tokio::task::block_in_place(|| Python::attach(|py| guard.clone_ref(py)))
+                tokio::task::block_in_place(|| {
+                    Python::try_attach(|py| guard.clone_ref(py))
+                })
+                .ok_or_else(|| std::io::Error::other("Python interpreter unavailable while cloning request after error"))?
             };
             let (on_error_opt, req_py) = PYTHON_EXECUTOR.update_request_error_async(request_clone).await?;
             let error_msg = e.to_string();
@@ -1309,13 +1504,18 @@ async fn process_request_async(
                 PYTHON_EXECUTOR.on_error_async(on_error, "Exception".to_string(), error_msg, Some(req_py)).await;
             } else {
                 PYTHON_EXECUTOR.handle_error_response_async(req_py, error_msg, gateway_name.to_string()).await;
-                PYTHON_EXECUTOR.save_connection_status(gateway_name.to_string(), false);
+                if should_save_connection_status_after_process_request_error(gateway_name) {
+                    PYTHON_EXECUTOR.save_connection_status(gateway_name.to_string(), false);
+                }
             }
         }
         Err(_) => {
             let request_clone = {
                 let guard = request_arc.read().await;
-                tokio::task::block_in_place(|| Python::attach(|py| guard.clone_ref(py)))
+                tokio::task::block_in_place(|| {
+                    Python::try_attach(|py| guard.clone_ref(py))
+                })
+                .ok_or_else(|| std::io::Error::other("Python interpreter unavailable while cloning request after timeout"))?
             };
             let (on_error_opt, req_py) = PYTHON_EXECUTOR.update_request_error_async(request_clone).await?;
             if let Some(on_error) = on_error_opt {
@@ -1333,6 +1533,7 @@ async fn process_request_async(
     Ok(())
 }
 
+/// 从共享请求对象中提取底层 HTTP 参数并执行请求。
 async fn execute_request_async_internal(
     client: &Client,
     request_arc: &Arc<RwLock<Py<Request>>>,
@@ -1343,12 +1544,14 @@ async fn execute_request_async_internal(
     let (url, method, headers_data, query_params, body_data, is_jsonrpc) = {
         let guard = request_arc.read().await;
         tokio::task::block_in_place(|| {
-            Python::attach(|py| extract_request_data_with_gil(py, &guard, url_base, gateway_name))
+            Python::try_attach(|py| extract_request_data_with_gil(py, &guard, url_base, gateway_name))
         })
+        .ok_or_else(|| std::io::Error::other("Python interpreter unavailable while extracting request data"))?
     };
     execute_request_with_data(client, &method, &url, headers_data, query_params, body_data, is_jsonrpc, gateway_name).await
 }
 
+/// 根据已展开的请求参数执行 HTTP 调用，并统一解析响应结果。
 async fn execute_request_with_data(
     client: &Client,
     method: &str,
@@ -1440,6 +1643,7 @@ async fn execute_request_with_data(
     Ok((status_code, response_text, json_body, response_headers))
 }
 
+/// 执行默认的失败响应处理逻辑。
 fn handle_failed_response(
     py: Python,
     status_code: u16,
@@ -1474,6 +1678,7 @@ fn handle_failed_response(
     Ok(())
 }
 
+/// 执行默认的异常响应处理逻辑。
 fn handle_error_response(
     py: Python,
     error_msg: &str,
@@ -1488,18 +1693,21 @@ fn handle_error_response(
     Ok(())
 }
 
+/// 调用 Python 侧公共日志函数。
 fn call_write_log(py: Python, msg: &str) -> PyResult<()> {
     let utility = py.import("vnpy.trader.utility")?;
     utility.getattr("write_log")?.call1((msg,))?;
     Ok(())
 }
 
+/// 调用 Python 侧连接状态保存函数。
 fn call_save_connection_status(py: Python, gateway_name: &str, status: bool) -> PyResult<()> {
     let utility = py.import("vnpy.trader.utility")?;
     utility.getattr("save_connection_status")?.call1((gateway_name, status))?;
     Ok(())
 }
 
+/// 将 `serde_json::Value` 递归转换为 Python 对象。
 fn json_to_pyobject(py: Python, value: &Value) -> PyResult<Py<PyAny>> {
     match value {
         Value::Object(map) => {
@@ -1522,6 +1730,7 @@ fn json_to_pyobject(py: Python, value: &Value) -> PyResult<Py<PyAny>> {
     }
 }
 
+/// 将 Python 字典递归序列化为 JSON 字符串。
 fn pythondict_to_json_string(dict: &Bound<PyDict>) -> PyResult<String> {
     let mut map = serde_json::Map::new();
     for (k, v) in dict.iter() {
@@ -1530,6 +1739,7 @@ fn pythondict_to_json_string(dict: &Bound<PyDict>) -> PyResult<String> {
     Ok(serde_json::to_string(&Value::Object(map)).unwrap())
 }
 
+/// 将常见 Python 对象递归转换为 JSON 值。
 fn pyany_to_json_value(obj: &Bound<PyAny>) -> PyResult<Value> {
     if obj.is_none() { return Ok(Value::Null); }
     if let Ok(b) = obj.extract::<bool>() { return Ok(Value::Bool(b)); }
@@ -1552,6 +1762,7 @@ fn pyany_to_json_value(obj: &Bound<PyAny>) -> PyResult<Value> {
     Ok(Value::String(obj.str()?.to_string()))
 }
 
+/// 对 HTTP 响应结果的 Python 友好封装。
 #[pyclass]
 pub struct PyResponseObject {
     #[pyo3(get)] status_code: u16,
@@ -1561,6 +1772,7 @@ pub struct PyResponseObject {
 
 #[pymethods]
 impl PyResponseObject {
+    /// 将响应文本解析为 Python 字典、列表或基础类型。
     fn json(&self, py: Python) -> PyResult<Py<PyAny>> {
         let value: Value = serde_json::from_str(&self.text)
             .map_err(|e| PyRuntimeError::new_err(format!("JSON decode error: {}", e)))?;
@@ -1568,6 +1780,7 @@ impl PyResponseObject {
     }
 }
 
+/// Python 模块初始化入口。
 #[pymodule]
 fn rust_rest_client(m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<RequestStatus>()?;
